@@ -1,0 +1,457 @@
+---
+# Apply SQL patch via Invoke-MssqlPatch.ps1. Idempotent on target_build.
+# Installer must include /norestart; Ansible owns reboot.
+
+- name: Refresh discovery for apply idempotency
+  ansible.builtin.include_tasks: discover.yml
+  tags:
+    - apply
+
+- name: Initialize apply control facts
+  ansible.builtin.set_fact:
+    mssql_apply_blocked: false
+    mssql_apply_readiness_blocked: false
+    mssql_apply_readiness_reason: ""
+    patch_attempted: false
+    patch_status: "{{ patch_status | default('not_attempted') }}"
+  changed_when: false
+  tags:
+    - apply
+
+- name: Skip when already compliant
+  ansible.builtin.set_fact:
+    patch_attempted: false
+    patch_status: already_compliant
+    mssql_installer_result_normalized: already_compliant
+  when:
+    - (mssql_instances_needing_patch | default([]) | length) == 0
+    - (mssql_instances_already_compliant | default([]) | length) > 0
+    - not (mssql_instance_scope_blocked | default(false) | bool)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Skip apply when stage failed
+  ansible.builtin.set_fact:
+    patch_attempted: false
+    patch_status: failed
+    mssql_apply_blocked: true
+    mssql_apply_readiness_reason: >-
+      Stage failed: {{ mssql_stage_failure_reason | default(stage_status | default('failed')) }}
+  when:
+    - not (patch_status | default('') in ['already_compliant'])
+    - (stage_status | default('')) == 'failed'
+  changed_when: false
+  tags:
+    - apply
+
+- name: Check pending reboot before apply
+  ansible.windows.win_shell: |
+    $pending = $false
+    $reasons = @()
+    $cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    $wu = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    if (Test-Path $cbs) { $pending = $true; $reasons += 'CBS_RebootPending' }
+    if (Test-Path $wu) { $pending = $true; $reasons += 'WU_RebootRequired' }
+    try {
+      $pv = (Get-ItemProperty -Path $sm -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+      if ($pv) { $pending = $true; $reasons += 'PendingFileRenameOperations' }
+    } catch {}
+    @{ pending_reboot = $pending; reasons = $reasons } | ConvertTo-Json -Compress
+  register: mssql_pending_reboot_raw
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+  changed_when: false
+  failed_when: false
+  tags:
+    - apply
+
+- name: Set pending_reboot fact before apply
+  ansible.builtin.set_fact:
+    pending_reboot: "{{ (mssql_pending_reboot_raw.stdout | default('{}') | from_json).pending_reboot | default(false) | bool }}"
+  when:
+    - mssql_pending_reboot_raw is defined
+    - not (mssql_pending_reboot_raw is skipped)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Re-derive staged installer path for apply
+  ansible.builtin.set_fact:
+    mssql_installer_staged_path: "{{ mssql_staging_dir }}\\{{ mssql_definition_installer_filename }}"
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+  changed_when: false
+  tags:
+    - apply
+
+- name: Stat staged installer for apply readiness
+  ansible.windows.win_stat:
+    path: "{{ mssql_installer_staged_path }}"
+    checksum_algorithm: "{{ mssql_definition_checksum_algorithm }}"
+    get_checksum: >-
+      {{
+        (mssql_require_installer_checksum | default(true) | bool)
+        or ((mssql_definition_checksum_value | default('') | length) > 0)
+      }}
+  register: mssql_installer_resolve_stat
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+  tags:
+    - apply
+
+- name: Evaluate staged installer for apply
+  ansible.builtin.set_fact:
+    mssql_installer_present: "{{ mssql_installer_resolve_stat.stat.exists | default(false) | bool }}"
+    mssql_installer_checksum_ok: >-
+      {{
+        true
+        if (
+          (mssql_definition_checksum_value | default('') | length) == 0
+          and not (mssql_require_installer_checksum | default(true) | bool)
+        )
+        else (
+          false
+          if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+          else (
+            false
+            if (
+              (mssql_require_installer_checksum | default(true) | bool)
+              and ((mssql_definition_checksum_value | default('') | length) == 0)
+            )
+            else (
+              true
+              if ((mssql_definition_checksum_value | default('') | length) == 0)
+              else (
+                (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+                == (mssql_definition_checksum_value | lower)
+              )
+            )
+          )
+        )
+      }}
+    mssql_installer_resolve_reason: >-
+      {{
+        'missing'
+        if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+        else (
+          'checksum_mismatch'
+          if (
+            ((mssql_definition_checksum_value | default('') | length) > 0)
+            and (
+              (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+              != (mssql_definition_checksum_value | lower)
+            )
+          )
+          else 'ok'
+        )
+      }}
+  when:
+    - mssql_installer_resolve_stat is defined
+    - not (mssql_installer_resolve_stat is skipped)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when pending reboot remains
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: blocked
+    mssql_apply_readiness_reason: Pending reboot must be cleared before SQL patch install.
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - pending_reboot | default(false) | bool
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when topology blocked
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: blocked
+    mssql_apply_readiness_reason: AG/FCI detected — remediation blocked.
+  when:
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - mssql_topology_blocked | default(false) | bool
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when instances blocked
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: blocked
+    mssql_apply_readiness_reason: One or more targeted instances failed applicability checks.
+  when:
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - (mssql_instances_blocked | default([]) | length) > 0
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when instance_scope invalid
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: blocked
+    mssql_apply_readiness_reason: "{{ mssql_instance_scope_block_reason | default('instance_scope not safely implemented') }}"
+  when:
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - mssql_instance_scope_blocked | default(false) | bool
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when staged installer missing
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: failed
+    mssql_apply_readiness_reason: >-
+      Staged installer not found at {{ mssql_installer_staged_path | default('') }}.
+  when:
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+    - not (mssql_installer_present | default(false) | bool)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Block apply when checksum invalid
+  ansible.builtin.set_fact:
+    mssql_apply_readiness_blocked: true
+    patch_status: failed
+    mssql_apply_readiness_reason: >-
+      Staged installer checksum validation failed
+      (reason={{ mssql_installer_resolve_reason | default('') }}).
+  when:
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed'])
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+    - mssql_installer_present | default(false) | bool
+    - not (mssql_installer_checksum_ok | default(false) | bool)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Build installer arguments (mandatory + optional extras)
+  ansible.builtin.set_fact:
+    mssql_installer_arguments: >-
+      {{
+        (
+          ['/quiet', '/IAcceptSQLServerLicenseTerms', '/Action=Patch', '/AllInstances', '/norestart']
+          + (
+            mssql_definition_extra_arguments | default([])
+            | reject('regex', '(?i)^/(quiet|iacceptsqlserverlicenseterms|action=|allinstances|instancename=|norestart)(\\b|=|$)')
+            | list
+          )
+        )
+        if (mssql_definition_instance_scope | default('all_instances') == 'all_instances')
+        else (
+          (
+            [
+              '/quiet',
+              '/IAcceptSQLServerLicenseTerms',
+              '/Action=Patch',
+              '/InstanceName=' ~ (mssql_instances_targeted[0].instance_name),
+              '/norestart'
+            ]
+            + (
+              mssql_definition_extra_arguments | default([])
+              | reject('regex', '(?i)^/(quiet|iacceptsqlserverlicenseterms|action=|allinstances|instancename=|norestart)(\\b|=|$)')
+              | list
+            )
+          )
+          if (
+            (mssql_definition_instance_scope | default('')) == 'named'
+            and (mssql_instances_targeted | default([]) | length) == 1
+          )
+          else []
+        )
+      }}
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - not (patch_status | default('') in ['already_compliant', 'failed', 'blocked'])
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+  changed_when: false
+  tags:
+    - apply
+
+- name: Ensure evidence directory exists
+  ansible.windows.win_file:
+    path: "{{ mssql_evidence_dir }}"
+    state: directory
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+    - (mssql_installer_arguments | default([]) | length) > 0
+  tags:
+    - apply
+
+- name: Copy PowerShell wrapper to target
+  ansible.windows.win_copy:
+    src: Invoke-MssqlPatch.ps1
+    dest: "{{ mssql_staging_dir }}\\Invoke-MssqlPatch.ps1"
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+    - (mssql_installer_arguments | default([]) | length) > 0
+  tags:
+    - apply
+
+- name: Execute SQL Server patch via wrapper
+  ansible.windows.win_shell: |
+    $wrapper = Join-Path '{{ mssql_staging_dir }}' 'Invoke-MssqlPatch.ps1'
+    $argsJson = @'
+    {{ mssql_installer_arguments | to_json }}
+    '@
+    & $wrapper `
+      -InstallerPath '{{ mssql_installer_staged_path }}' `
+      -ArgumentsJson $argsJson `
+      -EvidenceDir '{{ mssql_evidence_dir }}' `
+      -KbId '{{ kb_id }}' `
+      -RunId '{{ mssql_run_id }}' `
+      -HostName '{{ inventory_hostname }}'
+  args:
+    executable: powershell
+  register: mssql_wrapper_exec
+  when:
+    - not (mssql_apply_blocked | default(false) | bool)
+    - not (mssql_apply_readiness_blocked | default(false) | bool)
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+    - (mssql_installer_arguments | default([]) | length) > 0
+  failed_when: false
+  tags:
+    - apply
+
+- name: Detect wrapper stdout that looks like JSON
+  ansible.builtin.set_fact:
+    mssql_wrapper_looks_like_json: >-
+      {{
+        (mssql_wrapper_exec.stdout | default('') | trim | regex_search('^\\{')) is not none
+      }}
+  when:
+    - mssql_wrapper_exec is defined
+    - not (mssql_wrapper_exec is skipped)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Parse wrapper JSON result
+  when:
+    - mssql_wrapper_exec is defined
+    - not (mssql_wrapper_exec is skipped)
+    - mssql_wrapper_looks_like_json | default(false) | bool
+  block:
+    - name: Load wrapper JSON
+      ansible.builtin.set_fact:
+        mssql_wrapper_result: "{{ mssql_wrapper_exec.stdout | from_json }}"
+        mssql_wrapper_json_ok: true
+        patch_attempted: true
+        mssql_installer_return_code_raw: "{{ (mssql_wrapper_exec.stdout | from_json).exit_code | default(1) }}"
+        mssql_setup_log_paths: "{{ (mssql_wrapper_exec.stdout | from_json).setup_log_paths | default([]) }}"
+        mssql_evidence_paths: "{{ (mssql_wrapper_exec.stdout | from_json).evidence_paths | default([]) }}"
+      changed_when: false
+  rescue:
+    - name: Record malformed wrapper JSON as patch failure
+      ansible.builtin.set_fact:
+        mssql_wrapper_json_ok: false
+        patch_attempted: true
+        patch_status: failed
+        mssql_installer_result_normalized: failed
+        mssql_installer_return_code: "{{ mssql_wrapper_exec.rc | default(1) }}"
+        mssql_failure_reason: Wrapper stdout looked like JSON but from_json parse failed.
+        mssql_apply_readiness_reason: Wrapper stdout looked like JSON but from_json parse failed.
+      changed_when: false
+  tags:
+    - apply
+
+- name: Fail closed when wrapper output is not JSON-shaped
+  ansible.builtin.set_fact:
+    mssql_wrapper_json_ok: false
+    patch_attempted: true
+    patch_status: failed
+    mssql_installer_result_normalized: failed
+    mssql_installer_return_code: "{{ mssql_wrapper_exec.rc | default(1) }}"
+    mssql_failure_reason: Wrapper returned empty or non-JSON stdout.
+    mssql_apply_readiness_reason: >-
+      Wrapper returned empty or non-JSON stdout
+      (ansible_rc={{ mssql_wrapper_exec.rc | default('n/a') }}).
+  when:
+    - mssql_wrapper_exec is defined
+    - not (mssql_wrapper_exec is skipped)
+    - not (mssql_wrapper_looks_like_json | default(false) | bool)
+  changed_when: false
+  tags:
+    - apply
+
+- name: Normalize installer return code
+  ansible.builtin.set_fact:
+    mssql_installer_return_code: "{{ mssql_installer_return_code_raw | int }}"
+    mssql_installer_result_normalized: >-
+      {{
+        'success'
+        if ((mssql_installer_return_code_raw | int) in (mssql_definition_success_rcs | default([0]) | map('int') | list))
+        else (
+          'reboot_required'
+          if ((mssql_installer_return_code_raw | int) in (mssql_definition_reboot_rcs | default([3010]) | map('int') | list))
+          else 'failed'
+        )
+      }}
+  when:
+    - patch_attempted | default(false) | bool
+    - mssql_wrapper_json_ok | default(false) | bool
+  changed_when: false
+  tags:
+    - apply
+
+- name: Set reboot_required and patch_status from normalized result
+  ansible.builtin.set_fact:
+    mssql_reboot_required: "{{ mssql_installer_result_normalized == 'reboot_required' }}"
+    reboot_required: "{{ mssql_installer_result_normalized == 'reboot_required' }}"
+    patch_status: >-
+      {{
+        'success'
+        if (mssql_installer_result_normalized == 'success')
+        else (
+          'reboot_required'
+          if (mssql_installer_result_normalized == 'reboot_required')
+          else 'failed'
+        )
+      }}
+  when:
+    - patch_attempted | default(false) | bool
+    - mssql_wrapper_json_ok | default(false) | bool
+  changed_when: false
+  tags:
+    - apply
+
+- name: Report apply outcome
+  ansible.builtin.debug:
+    msg: >-
+      apply host={{ inventory_hostname }}
+      attempted={{ patch_attempted | default(false) }}
+      status={{ patch_status | default('n/a') }}
+      result={{ mssql_installer_result_normalized | default('n/a') }}
+      rc={{ mssql_installer_return_code | default('n/a') }}
+      reason={{ mssql_apply_readiness_reason | default('') }}
+  changed_when: false
+  tags:
+    - apply

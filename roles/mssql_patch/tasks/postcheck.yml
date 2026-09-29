@@ -1,0 +1,214 @@
+---
+# Postcheck — verify builds/services/databases when connectivity allows.
+
+- name: Refresh discovery for post-build verification
+  ansible.builtin.include_tasks: discover.yml
+  tags:
+    - postcheck
+
+- name: Compare targeted instance builds to target_build
+  ansible.builtin.set_fact:
+    mssql_postcheck_not_at_target: >-
+      {{
+        mssql_instances_targeted | default([])
+        | rejectattr('version.product_version', 'equalto', mssql_definition_target_build)
+        | list
+      }}
+  when:
+    - (mssql_instances_targeted | default([]) | length) > 0
+    - patch_attempted | default(false) | bool
+      or (patch_status | default('') in ['already_compliant', 'success', 'reboot_required'])
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Initialize empty not-at-target when build compare skipped
+  ansible.builtin.set_fact:
+    mssql_postcheck_not_at_target: []
+  when: mssql_postcheck_not_at_target is not defined
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Inspect SQL services for targeted instances
+  ansible.windows.win_service_info:
+    name: "{{ item.service_name }}"
+  loop: "{{ mssql_instances_targeted | default([]) }}"
+  loop_control:
+    label: "{{ item.service_name }}"
+  register: mssql_postcheck_services
+  when: (mssql_instances_targeted | default([]) | length) > 0
+  failed_when: false
+  tags:
+    - postcheck
+
+- name: Inspect SQL Agent services for targeted instances
+  ansible.windows.win_service_info:
+    name: "{{ item.agent_service_name }}"
+  loop: "{{ mssql_instances_targeted | default([]) }}"
+  loop_control:
+    label: "{{ item.agent_service_name }}"
+  register: mssql_postcheck_agent_services
+  when:
+    - (mssql_instances_targeted | default([]) | length) > 0
+    - mssql_require_sql_agent | default(false) | bool
+  failed_when: false
+  tags:
+    - postcheck
+
+- name: Derive SQL service health
+  ansible.builtin.set_fact:
+    mssql_postcheck_services_failed: >-
+      {{
+        (mssql_instances_targeted | default([]) | length)
+        != (
+          mssql_postcheck_services.results | default([])
+          | selectattr('services', 'defined')
+          | map(attribute='services')
+          | select('truthy')
+          | map('first')
+          | selectattr('state', 'equalto', 'started')
+          | list | length
+        )
+      }}
+  when: mssql_postcheck_services is defined
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Derive SQL Agent health when required
+  ansible.builtin.set_fact:
+    mssql_postcheck_agent_failed: >-
+      {{
+        mssql_require_sql_agent | default(false) | bool
+        and (
+          (mssql_instances_targeted | default([]) | length)
+          != (
+            mssql_postcheck_agent_services.results | default([])
+            | selectattr('services', 'defined')
+            | map(attribute='services')
+            | select('truthy')
+            | map('first')
+            | selectattr('state', 'equalto', 'started')
+            | list | length
+          )
+        )
+      }}
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Query database accessibility for targeted instances
+  ansible.windows.win_shell: |
+    $instanceName = '{{ item.instance_name }}'
+    $server = if ($instanceName -eq 'MSSQLSERVER') { 'localhost' } else { "localhost\$instanceName" }
+    $q = @"
+    SET NOCOUNT ON;
+    SELECT name, state_desc FROM sys.databases
+    WHERE state_desc NOT IN ('ONLINE','RESTORING');
+    "@
+    $out = & '{{ mssql_sqlcmd_path }}' -S $server -E -h -1 -W -Q $q 2>&1
+    $unexpected = @(($out | Where-Object { $_ -and $_.ToString().Trim() -ne '' }))
+    @{
+      ok = ($LASTEXITCODE -eq 0)
+      unexpected_count = $unexpected.Count
+      exit_code = $LASTEXITCODE
+    } | ConvertTo-Json -Compress
+  loop: "{{ mssql_instances_targeted | default([]) }}"
+  loop_control:
+    label: "{{ item.instance_name }}"
+  register: mssql_db_validation
+  when:
+    - (mssql_instances_targeted | default([]) | length) > 0
+    - mssql_definition_verify_databases | default(true) | bool
+    - patch_attempted | default(false) | bool
+      or (patch_status | default('') in ['already_compliant', 'success', 'reboot_required'])
+  changed_when: false
+  failed_when: false
+  tags:
+    - postcheck
+
+- name: Derive database validation health
+  ansible.builtin.set_fact:
+    mssql_postcheck_db_query_failed: >-
+      {{
+        mssql_db_validation.results | default([])
+        | map(attribute='stdout')
+        | map('default', '{}')
+        | map('from_json')
+        | selectattr('ok', 'defined')
+        | rejectattr('ok')
+        | list
+        | length > 0
+      }}
+    mssql_postcheck_db_unexpected_states: >-
+      {{
+        mssql_db_validation.results | default([])
+        | map(attribute='stdout')
+        | map('default', '{}')
+        | map('from_json')
+        | selectattr('unexpected_count', 'defined')
+        | selectattr('unexpected_count', 'gt', 0)
+        | list
+        | length > 0
+      }}
+  when: mssql_db_validation is defined
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Capture post-build summary
+  ansible.builtin.set_fact:
+    mssql_post_builds: >-
+      {{
+        mssql_instances_targeted | default([])
+        | map(attribute='version.product_version')
+        | list
+      }}
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Derive postcheck_status
+  ansible.builtin.set_fact:
+    postcheck_status: >-
+      {{
+        'failed'
+        if (
+          (mssql_instance_scope_blocked | default(false) | bool)
+          or ((mssql_postcheck_not_at_target | default([]) | length) > 0)
+          or (mssql_postcheck_services_failed | default(false) | bool)
+          or (mssql_postcheck_agent_failed | default(false) | bool)
+          or (mssql_postcheck_db_query_failed | default(false) | bool)
+          or (mssql_postcheck_db_unexpected_states | default(false) | bool)
+        )
+        else (
+          'degraded'
+          if (pending_reboot | default(false) | bool)
+          else 'ok'
+        )
+      }}
+    manual_followup_required: >-
+      {{
+        (manual_followup_required | default(false) | bool)
+        or (pending_reboot | default(false) | bool)
+        or ((mssql_postcheck_not_at_target | default([]) | length) > 0)
+        or (mssql_postcheck_services_failed | default(false) | bool)
+        or (mssql_postcheck_agent_failed | default(false) | bool)
+        or (mssql_postcheck_db_query_failed | default(false) | bool)
+        or (mssql_postcheck_db_unexpected_states | default(false) | bool)
+      }}
+  changed_when: false
+  tags:
+    - postcheck
+
+- name: Postcheck summary
+  ansible.builtin.debug:
+    msg: >-
+      postcheck host={{ inventory_hostname }}
+      status={{ postcheck_status }}
+      not_at_target={{ mssql_postcheck_not_at_target | default([]) | length }}
+      pending_reboot={{ pending_reboot | default(false) }}
+  changed_when: false
+  tags:
+    - postcheck

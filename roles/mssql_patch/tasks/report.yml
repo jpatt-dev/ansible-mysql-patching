@@ -1,0 +1,196 @@
+---
+# Evidence JSON on target + mssql_patch_results for AAP.
+
+- name: Ensure evidence directory exists
+  ansible.windows.win_file:
+    path: "{{ mssql_evidence_dir }}"
+    state: directory
+  when:
+    - mssql_execute_patch | default(false) | bool
+    - mssql_connectivity_ok | default(false) | bool
+  failed_when: false
+  tags:
+    - report
+
+- name: Write evidence summary JSON on target
+  ansible.windows.win_copy:
+    content: |
+      {{
+        {
+          'host': inventory_hostname,
+          'kb_id': kb_id | default(''),
+          'run_id': mssql_run_id | default(''),
+          'target_build': mssql_definition_target_build | default(''),
+          'change_ticket_id': change_ticket_id | default(''),
+          'patch_attempted': patch_attempted | default(false),
+          'patch_status': patch_status | default('not_attempted'),
+          'discovery_status': mssql_discovery_status | default('n/a'),
+          'precheck_status': precheck_status | default('n/a'),
+          'postcheck_status': postcheck_status | default('n/a'),
+          'installer_return_code': mssql_installer_return_code | default('not_available'),
+          'installer_result_normalized': mssql_installer_result_normalized | default('not_available'),
+          'setup_log_paths': mssql_setup_log_paths | default([]),
+          'timestamp': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ')
+        } | to_nice_json
+      }}
+    dest: >-
+      {{ mssql_evidence_dir }}\mssql-patch-evidence-{{ inventory_hostname }}-{{ kb_id | default('nokb') }}-{{ mssql_run_id | default('run') }}.json
+  when:
+    - mssql_execute_patch | default(false) | bool
+    - mssql_connectivity_ok | default(false) | bool
+  failed_when: false
+  tags:
+    - report
+
+- name: Record evidence path fact
+  ansible.builtin.set_fact:
+    mssql_evidence_paths: >-
+      {{
+        (mssql_evidence_paths | default([]))
+        + [
+          mssql_evidence_dir ~ '\\mssql-patch-evidence-'
+          ~ inventory_hostname ~ '-'
+          ~ (kb_id | default('nokb')) ~ '-'
+          ~ (mssql_run_id | default('run')) ~ '.json'
+        ]
+      }}
+  when:
+    - mssql_execute_patch | default(false) | bool
+    - mssql_connectivity_ok | default(false) | bool
+  changed_when: false
+  tags:
+    - report
+
+- name: Capture job end timestamp
+  ansible.builtin.set_fact:
+    mssql_job_ended_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+  changed_when: false
+  tags:
+    - report
+
+- name: Derive final_status
+  ansible.builtin.set_fact:
+    mssql_final_status: >-
+      {{
+        'precheck_only'
+        if (not (mssql_execute_patch | default(false) | bool))
+        else (
+          'excluded'
+          if (patching_exception_active | default(false) | bool or precheck_status | default('') == 'excluded')
+          else (
+            'blocked'
+            if (precheck_status | default('') == 'blocked' or patch_status | default('') == 'blocked')
+            else (
+              'failed'
+              if (
+                (precheck_status | default('') == 'failed')
+                or (stage_status | default('') == 'failed')
+                or (patch_status | default('') == 'failed')
+                or (postcheck_status | default('') == 'failed')
+              )
+              else (
+                'compliant'
+                if (
+                  (patch_status | default('') in ['already_compliant', 'success'])
+                  or (
+                    (patch_status | default('') == 'reboot_required')
+                    and ((mssql_installer_result_normalized | default('')) == 'reboot_required')
+                    and (post_reboot_performed | default(false) | bool)
+                    and ((postcheck_status | default('')) == 'ok')
+                    and not (pending_reboot | default(false) | bool)
+                    and not (manual_followup_required | default(false) | bool)
+                  )
+                )
+                else (
+                  'degraded'
+                  if (
+                    (postcheck_status | default('') == 'degraded')
+                    or (manual_followup_required | default(false) | bool)
+                    or (patch_status | default('') == 'reboot_required')
+                  )
+                  else (patch_status | default(precheck_status | default('unknown')))
+                )
+              )
+            )
+          )
+        )
+      }}
+  changed_when: false
+  tags:
+    - report
+
+- name: Build mssql_host_result
+  ansible.builtin.set_fact:
+    mssql_host_result:
+      host: "{{ inventory_hostname }}"
+      final_status: "{{ mssql_final_status }}"
+      change_ticket_id: "{{ change_ticket_id | default('') }}"
+      kb_id: "{{ kb_id | default('') }}"
+      run_id: "{{ mssql_run_id | default('') }}"
+      target_build: "{{ mssql_definition_target_build | default('') }}"
+      pre_builds: "{{ mssql_pre_builds | default([]) }}"
+      post_builds: "{{ mssql_post_builds | default([]) }}"
+      instances_targeted: "{{ mssql_instances_targeted | default([]) | map(attribute='instance_name') | list }}"
+      discovery_status: "{{ mssql_discovery_status | default('n/a') }}"
+      precheck_status: "{{ precheck_status | default('n/a') }}"
+      patch_status: "{{ patch_status | default('not_attempted') }}"
+      postcheck_status: "{{ postcheck_status | default('n/a') }}"
+      patch_attempted: "{{ patch_attempted | default(false) | bool }}"
+      installer_return_code: "{{ mssql_installer_return_code | default('not_available') }}"
+      installer_result_normalized: "{{ mssql_installer_result_normalized | default('not_available') }}"
+      failure_reason: "{{ mssql_failure_reason | default(mssql_apply_readiness_reason | default('')) }}"
+      reboot_required: "{{ reboot_required | default(false) | bool }}"
+      pre_reboot_performed: "{{ pre_reboot_performed | default(false) | bool }}"
+      post_reboot_performed: "{{ post_reboot_performed | default(false) | bool }}"
+      evidence_paths: "{{ mssql_evidence_paths | default([]) }}"
+      setup_log_paths: "{{ mssql_setup_log_paths | default([]) }}"
+      started_at: "{{ mssql_job_started_at | default('') }}"
+      ended_at: "{{ mssql_job_ended_at | default('') }}"
+  changed_when: false
+  tags:
+    - report
+
+- name: Initialize mssql_patch_results map
+  ansible.builtin.set_fact:
+    mssql_patch_results: {}
+  run_once: true
+  changed_when: false
+  tags:
+    - report
+
+- name: Build host-keyed mssql_patch_results from hostvars
+  ansible.builtin.set_fact:
+    mssql_patch_results: >-
+      {{
+        mssql_patch_results
+        | combine({ item: hostvars[item].mssql_host_result })
+      }}
+  loop: "{{ ansible_play_hosts_all }}"
+  when: hostvars[item].mssql_host_result is defined
+  run_once: true
+  changed_when: false
+  tags:
+    - report
+
+- name: Publish mssql_patch_results for AAP
+  ansible.builtin.set_stats:
+    data:
+      mssql_patch_results: "{{ mssql_patch_results | default({}) }}"
+    per_host: false
+  run_once: true
+  tags:
+    - report
+
+- name: Final result summary
+  ansible.builtin.debug:
+    msg: >-
+      result host={{ inventory_hostname }}
+      final={{ mssql_final_status }}
+      kb={{ kb_id | default('') }}
+      attempted={{ patch_attempted | default(false) }}
+      patch_status={{ patch_status | default('not_attempted') }}
+      precheck={{ precheck_status | default('n/a') }}
+      postcheck={{ postcheck_status | default('n/a') }}
+  changed_when: false
+  tags:
+    - report

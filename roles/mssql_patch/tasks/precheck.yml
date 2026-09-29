@@ -1,0 +1,421 @@
+---
+# Precheck gates and mssql_remediation_eligible.
+
+- name: Mark excluded when inventory exception is active
+  ansible.builtin.set_fact:
+    precheck_status: excluded
+    mssql_remediation_eligible: false
+    mssql_precheck_gates:
+      - id: patch_exception
+        status: excluded
+        detail: inventory patching_exception_enabled
+  when: patching_exception_active | default(false) | bool
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Initialize precheck gate list
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: []
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — Windows connectivity
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'connectivity',
+          'status': (mssql_connectivity_ok | bool) | ternary('passed', 'failed'),
+          'detail': (mssql_connectivity_ok | bool) | ternary('WinRM reachable', 'WinRM unreachable')
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — instances discovered
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'instances_discovered',
+          'status': (
+            'passed' if ((mssql_instances | default([]) | length) > 0)
+            else 'blocked'
+          ),
+          'detail': 'instance_count=' ~ (mssql_instances | default([]) | length | string)
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — patch definition loaded
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'patch_definition',
+          'status': (
+            'passed' if ((kb_id | default('') | length) > 0)
+            else 'blocked'
+          ),
+          'detail': kb_id | default('missing')
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — topology AG/FCI
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'topology',
+          'status': (mssql_topology_blocked | default(false) | bool) | ternary('blocked', 'passed'),
+          'detail': (
+            'AG/FCI detected — remediation blocked'
+            if (mssql_topology_blocked | default(false) | bool)
+            else 'standalone'
+          )
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — blocked instances (branch/major/unknown)
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'applicability',
+          'status': (
+            'blocked' if ((mssql_instances_blocked | default([]) | length) > 0)
+            else (
+              'passed' if ((mssql_instances_needing_patch | default([]) | length) > 0 or (mssql_instances_already_compliant | default([]) | length) > 0)
+              else 'warning'
+            )
+          ),
+          'detail': >-
+            applicable={{ mssql_instances_needing_patch | default([]) | length }},
+            compliant={{ mssql_instances_already_compliant | default([]) | length }},
+            blocked={{ mssql_instances_blocked | default([]) | length }}
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — instance_scope
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'instance_scope',
+          'status': (mssql_instance_scope_blocked | default(false) | bool) | ternary('blocked', 'passed'),
+          'detail': mssql_instance_scope_block_reason | default('ok')
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Collect free disk space on system drive
+  ansible.windows.win_shell: |
+    $d = Get-PSDrive -Name C
+    [math]::Round(($d.Free / 1MB), 0)
+  register: mssql_disk_free_raw
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+  changed_when: false
+  failed_when: false
+  tags:
+    - precheck
+
+- name: Gate — disk space
+  ansible.builtin.set_fact:
+    mssql_free_disk_mb: "{{ mssql_disk_free_raw.stdout | default('0') | trim | int }}"
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'disk_space',
+          'status': (
+            'blocked'
+            if ((mssql_disk_free_raw.stdout | default('0') | trim | int) < (mssql_precheck_min_free_disk_mb | int))
+            else (
+              'warning'
+              if ((mssql_disk_free_raw.stdout | default('0') | trim | int) < (mssql_precheck_soft_free_disk_mb | int))
+              else 'passed'
+            )
+          ),
+          'detail': 'free_mb=' ~ (mssql_disk_free_raw.stdout | default('0') | trim)
+        }]
+      }}
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — pending reboot
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'pending_reboot',
+          'status': (pending_reboot | default(false) | bool) | ternary('warning', 'passed'),
+          'detail': (pending_reboot | default(false) | bool) | ternary('pending reboot detected', 'no pending reboot')
+        }]
+      }}
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — installer source configured
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'installer_source',
+          'status': (
+            'passed'
+            if (
+              (mssql_installer_pre_staged | default(false) | bool)
+              or ((mssql_installer_source_location | default('') | length) > 0)
+            )
+            else 'blocked'
+          ),
+          'detail': (
+            'pre_staged'
+            if (mssql_installer_pre_staged | default(false) | bool)
+            else (
+              mssql_installer_source_location
+              if ((mssql_installer_source_location | default('') | length) > 0)
+              else 'mssql_installer_source_location unset and not pre_staged'
+            )
+          )
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — checksum policy
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'checksum',
+          'status': (
+            'blocked'
+            if (
+              (mssql_require_installer_checksum | default(true) | bool)
+              and ((mssql_definition_checksum_value | default('') | length) == 0)
+            )
+            else 'passed'
+          ),
+          'detail': (
+            'checksum required but missing in patch definition'
+            if (
+              (mssql_require_installer_checksum | default(true) | bool)
+              and ((mssql_definition_checksum_value | default('') | length) == 0)
+            )
+            else 'checksum policy satisfied or not required'
+          )
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Gate — not_applicable source builds
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'allowed_source_builds',
+          'status': (
+            'blocked' if ((mssql_instances_not_applicable | default([]) | length) > 0)
+            else 'passed'
+          ),
+          'detail': 'not_applicable=' ~ (mssql_instances_not_applicable | default([]) | length | string)
+        }]
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Inspect SQL service state for targeted instances
+  ansible.windows.win_service_info:
+    name: "{{ item.service_name }}"
+  loop: "{{ mssql_instances_targeted | default([]) }}"
+  loop_control:
+    label: "{{ item.service_name }}"
+  register: mssql_service_info
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+    - (mssql_instances_targeted | default([]) | length) > 0
+  failed_when: false
+  tags:
+    - precheck
+
+- name: Gate — targeted SQL services must exist and be started
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'sql_services',
+          'status': (
+            'blocked'
+            if (
+              (mssql_instances_targeted | default([]) | length)
+              != (
+                mssql_service_info.results | default([])
+                | selectattr('services', 'defined')
+                | map(attribute='services')
+                | select('truthy')
+                | map('first')
+                | selectattr('state', 'equalto', 'started')
+                | list | length
+              )
+            )
+            else 'passed'
+          ),
+          'detail': 'targeted SQL Server service must exist and be started'
+        }]
+      }}
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+    - mssql_service_info is defined
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Inspect SQL Agent for targeted instances when required
+  ansible.windows.win_service_info:
+    name: "{{ item.agent_service_name }}"
+  loop: "{{ mssql_instances_targeted | default([]) }}"
+  loop_control:
+    label: "{{ item.agent_service_name }}"
+  register: mssql_agent_service_info
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_connectivity_ok | bool
+    - mssql_require_sql_agent | default(false) | bool
+    - (mssql_instances_targeted | default([]) | length) > 0
+  failed_when: false
+  tags:
+    - precheck
+
+- name: Gate — targeted SQL Agent must exist and be started when required
+  ansible.builtin.set_fact:
+    mssql_precheck_gates: >-
+      {{
+        mssql_precheck_gates + [{
+          'id': 'sql_agent',
+          'status': (
+            'blocked'
+            if (
+              (mssql_instances_targeted | default([]) | length)
+              != (
+                mssql_agent_service_info.results | default([])
+                | selectattr('services', 'defined')
+                | map(attribute='services')
+                | select('truthy')
+                | map('first')
+                | selectattr('state', 'equalto', 'started')
+                | list | length
+              )
+            )
+            else 'passed'
+          ),
+          'detail': 'targeted SQL Agent service must exist and be started'
+        }]
+      }}
+  when:
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_require_sql_agent | default(false) | bool
+    - mssql_agent_service_info is defined
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Derive overall precheck_status
+  ansible.builtin.set_fact:
+    precheck_status: >-
+      {{
+        'failed'
+        if ((mssql_precheck_gates | selectattr('status', 'equalto', 'failed') | list | length) > 0)
+        else (
+          'blocked'
+          if ((mssql_precheck_gates | selectattr('status', 'equalto', 'blocked') | list | length) > 0)
+          else (
+            'warning'
+            if ((mssql_precheck_gates | selectattr('status', 'equalto', 'warning') | list | length) > 0)
+            else 'passed'
+          )
+        )
+      }}
+  when: not (patching_exception_active | default(false) | bool)
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Capture pre-build summary
+  ansible.builtin.set_fact:
+    mssql_pre_builds: >-
+      {{
+        mssql_instances_targeted | default([])
+        | map(attribute='version.product_version')
+        | list
+      }}
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Set mssql_remediation_eligible
+  ansible.builtin.set_fact:
+    mssql_remediation_eligible: >-
+      {{
+        not (patching_exception_active | default(false) | bool)
+        and (precheck_status | default('') in ['passed', 'warning'])
+        and not (mssql_topology_blocked | default(false) | bool)
+        and not (mssql_instance_scope_blocked | default(false) | bool)
+        and ((mssql_instances_not_applicable | default([]) | length) == 0)
+      }}
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Precheck summary
+  ansible.builtin.debug:
+    msg: >-
+      precheck host={{ inventory_hostname }}
+      status={{ precheck_status }}
+      eligible={{ mssql_remediation_eligible }}
+      execute_patch={{ mssql_execute_patch | default(false) }}
+      not_applicable={{ mssql_instances_not_applicable | default([]) | length }}
+  changed_when: false
+  tags:
+    - precheck

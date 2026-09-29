@@ -1,0 +1,32 @@
+---
+# Configurable knobs for MSSQL patching. Runtime facts are set in tasks.
+
+mssql_execute_patch: false
+mssql_patch_definition_id: ""
+change_ticket_id: ""
+mssql_patch_definitions_dir: "{{ playbook_dir }}/../vars/mssql_patches"
+
+mssql_installer_source_location: ""
+mssql_installer_pre_staged: false
+mssql_require_installer_checksum: true
+mssql_staging_dir: 'C:\ProgramData\AAP\mssql_patch\staging'
+mssql_evidence_dir: 'C:\ProgramData\AAP\mssql_patch\evidence'
+
+patch_require_explicit_limit: true
+patch_unsafe_targets:
+  - all
+  - "*"
+  - mssql_hosts
+patching_exception_enabled: false
+
+mssql_precheck_min_free_disk_mb: 5120
+mssql_precheck_soft_free_disk_mb: 10240
+mssql_require_sql_agent: false
+
+mssql_sqlcmd_path: sqlcmd
+
+mssql_pre_patch_reboot_mode: if_required
+mssql_post_patch_reboot_mode: if_required
+mssql_reboot_timeout: 3600
+mssql_pre_reboot_delay: 60
+mssql_post_reboot_delay: 60

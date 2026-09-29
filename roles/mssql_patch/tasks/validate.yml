@@ -1,0 +1,144 @@
+---
+# Limit safety, inventory exception, load and normalize vars/mssql_patches/<id>.yml
+
+- name: Derive inventory patch exemption
+  ansible.builtin.set_fact:
+    patching_exception_active: "{{ patching_exception_enabled | default(false) | bool }}"
+  changed_when: false
+
+- name: Set run id for unique evidence filenames
+  ansible.builtin.set_fact:
+    mssql_run_id: >-
+      {{
+        (tower_job_id | default(awx_job_id | default('')) | string)
+        if ((tower_job_id | default(awx_job_id | default('')) | string | length) > 0)
+        else (mssql_job_started_at | default(now(utc=true, fmt='%Y%m%dT%H%M%SZ')) | regex_replace('[^0-9A-Za-z]', ''))
+      }}
+    patch_status: not_attempted
+    patch_attempted: false
+    mssql_remediation_eligible: false
+  changed_when: false
+
+- name: Normalize AAP Limit
+  ansible.builtin.set_fact:
+    patch_target_scope: "{{ ansible_limit | default('') | trim }}"
+  run_once: true
+  changed_when: false
+
+- name: Require explicit AAP Limit
+  ansible.builtin.assert:
+    that:
+      - (patch_target_scope | default('') | length) > 0
+      - (patch_target_scope | lower) not in (patch_unsafe_targets | default(['all', '*', 'mssql_hosts']) | map('lower') | list)
+    fail_msg: >-
+      Launch with an explicit AAP Limit that is not the full safety boundary.
+      Blank Limit, 'all', '*', and 'mssql_hosts' are not allowed
+      (ansible_limit='{{ ansible_limit | default('') }}').
+  when: patch_require_explicit_limit | default(true) | bool
+  run_once: true
+
+- name: Resolve patch definition id
+  ansible.builtin.set_fact:
+    mssql_patch_definition_id_effective: "{{ mssql_patch_definition_id | default('') | trim }}"
+  changed_when: false
+
+- name: Require mssql_patch_definition_id
+  ansible.builtin.assert:
+    that:
+      - (mssql_patch_definition_id_effective | length) > 0
+    fail_msg: mssql_patch_definition_id is required (basename under vars/mssql_patches/).
+
+- name: Validate mssql_patch_definition_id characters
+  ansible.builtin.assert:
+    that:
+      - mssql_patch_definition_id_effective is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+    fail_msg: >-
+      mssql_patch_definition_id must match ^[A-Za-z0-9][A-Za-z0-9_-]*$
+      (got '{{ mssql_patch_definition_id_effective }}').
+
+- name: Resolve patch definition search paths
+  ansible.builtin.set_fact:
+    mssql_patch_definitions_search_paths:
+      - "{{ mssql_patch_definitions_dir }}"
+      - "{{ playbook_dir }}/../vars/mssql_patches"
+      - "{{ role_path }}/../../vars/mssql_patches"
+  changed_when: false
+  run_once: true
+
+- name: Find patch definition file
+  ansible.builtin.set_fact:
+    mssql_patch_definition_file: >-
+      {{
+        lookup(
+          'first_found',
+          {
+            'files': [
+              mssql_patch_definition_id_effective ~ '.yml',
+              mssql_patch_definition_id_effective ~ '.yaml'
+            ],
+            'paths': mssql_patch_definitions_search_paths,
+            'skip': true
+          }
+        )
+      }}
+  changed_when: false
+  run_once: true
+
+- name: Fail when patch definition is missing
+  ansible.builtin.assert:
+    that:
+      - (mssql_patch_definition_file | default('') | length) > 0
+    fail_msg: >-
+      Patch definition '{{ mssql_patch_definition_id_effective }}' not found under
+      vars/mssql_patches/ (searched: {{ mssql_patch_definitions_search_paths | join(', ') }}).
+
+- name: Load patch definition YAML
+  ansible.builtin.set_fact:
+    mssql_patch_definition: "{{ lookup('file', mssql_patch_definition_file) | from_yaml }}"
+  changed_when: false
+  run_once: true
+
+- name: Validate required patch definition fields
+  ansible.builtin.assert:
+    that:
+      - mssql_patch_definition.kb_id is defined
+      - (mssql_patch_definition.kb_id | string | length) > 0
+      - mssql_patch_definition.sql_product_major_version is defined
+      - mssql_patch_definition.servicing_branch is defined
+      - (mssql_patch_definition.servicing_branch | upper) in ['CU', 'GDR']
+      - mssql_patch_definition.target_build is defined
+      - (mssql_patch_definition.target_build | string | length) > 0
+      - mssql_patch_definition.platform is defined
+      - (mssql_patch_definition.platform | string | lower) == 'windows'
+      - mssql_patch_definition.installer is defined
+      - mssql_patch_definition.installer.filename is defined
+      - (mssql_patch_definition.installer.filename | string | length) > 0
+      - >
+          not (mssql_require_installer_checksum | default(true) | bool)
+          or (
+            (mssql_patch_definition.installer.checksum.algorithm | default('') | length) > 0
+            and (mssql_patch_definition.installer.checksum.value | default('') | length) > 0
+          )
+    fail_msg: >-
+      Patch definition '{{ mssql_patch_definition_file }}' missing required fields
+      (kb_id, sql_product_major_version, servicing_branch CU|GDR, target_build,
+      platform=windows, installer.filename, and checksum when required).
+
+- name: Normalize definition facts
+  ansible.builtin.set_fact:
+    kb_id: "{{ mssql_patch_definition.kb_id }}"
+    mssql_definition_sql_product_major_version: "{{ mssql_patch_definition.sql_product_major_version | int }}"
+    mssql_definition_servicing_branch: "{{ mssql_patch_definition.servicing_branch | upper }}"
+    mssql_definition_target_build: "{{ mssql_patch_definition.target_build | string }}"
+    mssql_definition_platform: "{{ mssql_patch_definition.platform | string | lower }}"
+    mssql_definition_installer_filename: "{{ mssql_patch_definition.installer.filename }}"
+    mssql_definition_checksum_algorithm: "{{ mssql_patch_definition.installer.checksum.algorithm | default('sha256') }}"
+    mssql_definition_checksum_value: "{{ mssql_patch_definition.installer.checksum.value | default('') }}"
+    mssql_definition_success_rcs: "{{ mssql_patch_definition.installer.success_return_codes | default([0]) }}"
+    mssql_definition_reboot_rcs: "{{ mssql_patch_definition.installer.reboot_return_codes | default([3010]) }}"
+    mssql_definition_instance_scope: "{{ mssql_patch_definition.installer.instance_scope | default('all_instances') | trim | lower }}"
+    mssql_definition_instance_names: "{{ mssql_patch_definition.installer.instance_names | default([]) }}"
+    mssql_definition_extra_arguments: "{{ mssql_patch_definition.installer.extra_arguments | default([]) }}"
+    mssql_definition_allowed_source_builds: "{{ mssql_patch_definition.current_build_requirements.allowed_source_builds | default([]) }}"
+    mssql_definition_verify_databases: "{{ mssql_patch_definition.validation_rules.verify_databases | default(true) | bool }}"
+  changed_when: false

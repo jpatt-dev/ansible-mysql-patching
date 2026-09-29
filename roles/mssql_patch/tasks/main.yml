@@ -1,0 +1,51 @@
+---
+# validate → discover → precheck → (optional remediation) → postcheck → report
+
+- name: Capture job start timestamp
+  ansible.builtin.set_fact:
+    mssql_job_started_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+  changed_when: false
+
+- name: Validate inputs and load patch definition
+  ansible.builtin.include_tasks: validate.yml
+
+- name: Discover SQL instances
+  ansible.builtin.include_tasks: discover.yml
+
+- name: Precheck and set remediation eligibility
+  ansible.builtin.include_tasks: precheck.yml
+
+- name: Remediation lifecycle
+  when:
+    - mssql_execute_patch | default(false) | bool
+    - mssql_remediation_eligible | default(false) | bool
+  block:
+    - name: Optional pre-patch reboot
+      ansible.builtin.include_tasks: reboot.yml
+      vars:
+        mssql_reboot_phase: pre
+
+    - name: Stage installer
+      ansible.builtin.include_tasks: stage.yml
+
+    - name: Apply SQL patch
+      ansible.builtin.include_tasks: apply.yml
+
+    - name: Optional post-patch reboot
+      ansible.builtin.include_tasks: reboot.yml
+      vars:
+        mssql_reboot_phase: post
+  rescue:
+    - name: Record remediation operational failure
+      ansible.builtin.set_fact:
+        patch_status: failed
+        mssql_failure_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result | string) }}"
+        mssql_apply_readiness_reason: "{{ ansible_failed_result.msg | default('remediation failed') }}"
+      changed_when: false
+
+- name: Postcheck
+  ansible.builtin.include_tasks: postcheck.yml
+  when: mssql_connectivity_ok | default(false) | bool
+
+- name: Publish evidence and final result
+  ansible.builtin.include_tasks: report.yml

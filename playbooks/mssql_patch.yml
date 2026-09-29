@@ -1,0 +1,8 @@
+---
+- name: MSSQL patch
+  hosts: mssql_hosts
+  gather_facts: false
+  vars:
+    mssql_execute_patch: true
+  roles:
+    - role: mssql_patch

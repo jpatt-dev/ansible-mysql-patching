@@ -1,0 +1,185 @@
+---
+# Optional reboot. Set mssql_reboot_phase: pre|post. Installer never reboots.
+
+- name: Normalize reboot phase and policy
+  ansible.builtin.set_fact:
+    mssql_reboot_phase: "{{ mssql_reboot_phase | default('post') | trim | lower }}"
+    mssql_reboot_mode_effective: >-
+      {{
+        (mssql_pre_patch_reboot_mode | default('if_required') | trim | lower)
+        if ((mssql_reboot_phase | default('post')) == 'pre')
+        else (mssql_post_patch_reboot_mode | default('if_required') | trim | lower)
+      }}
+  tags:
+    - reboot
+
+- name: Assert reboot mode is supported
+  ansible.builtin.assert:
+    that:
+      - mssql_reboot_mode_effective in ['never', 'if_required', 'always']
+    fail_msg: >-
+      Unsupported reboot mode '{{ mssql_reboot_mode_effective }}' on {{ inventory_hostname }}.
+      Allowed: never, if_required, always.
+  tags:
+    - reboot
+
+- name: Derive apply reboot signal for post phase
+  ansible.builtin.set_fact:
+    mssql_apply_reboot_required: >-
+      {{
+        (reboot_required | default(false) | bool)
+        or (mssql_reboot_required | default(false) | bool)
+        or ((mssql_installer_result_normalized | default('')) == 'reboot_required')
+        or ((patch_status | default('')) == 'reboot_required')
+      }}
+  when: mssql_reboot_phase == 'post'
+  changed_when: false
+  tags:
+    - reboot
+
+- name: Check Windows pending reboot indicators
+  ansible.windows.win_shell: |
+    $pending = $false
+    $reasons = @()
+    $cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    $wu = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    if (Test-Path $cbs) { $pending = $true; $reasons += 'CBS_RebootPending' }
+    if (Test-Path $wu) { $pending = $true; $reasons += 'WU_RebootRequired' }
+    try {
+      $pv = (Get-ItemProperty -Path $sm -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+      if ($pv) { $pending = $true; $reasons += 'PendingFileRenameOperations' }
+    } catch {}
+    @{ pending_reboot = $pending; reasons = $reasons } | ConvertTo-Json -Compress
+  register: mssql_pending_reboot_raw
+  changed_when: false
+  failed_when: false
+  tags:
+    - reboot
+
+- name: Set pending_reboot fact
+  ansible.builtin.set_fact:
+    pending_reboot: "{{ (mssql_pending_reboot_raw.stdout | default('{}') | from_json).pending_reboot | default(false) | bool }}"
+    pending_reboot_reasons: "{{ (mssql_pending_reboot_raw.stdout | default('{}') | from_json).reasons | default([]) }}"
+  changed_when: false
+  tags:
+    - reboot
+
+- name: Derive whether this reboot phase should run
+  ansible.builtin.set_fact:
+    mssql_reboot_should_run: >-
+      {{
+        (mssql_reboot_mode_effective != 'never')
+        and (
+          (mssql_reboot_mode_effective == 'always')
+          or (pending_reboot | default(false) | bool)
+          or (
+            (mssql_reboot_phase == 'post')
+            and (mssql_apply_reboot_required | default(false) | bool)
+          )
+        )
+      }}
+  changed_when: false
+  tags:
+    - reboot
+
+- name: Reboot host when policy allows
+  ansible.windows.win_reboot:
+    reboot_timeout: "{{ mssql_reboot_timeout | default(3600) | int }}"
+    pre_reboot_delay: "{{ mssql_pre_reboot_delay | default(60) | int }}"
+    post_reboot_delay: "{{ mssql_post_reboot_delay | default(60) | int }}"
+  register: mssql_reboot_result
+  when: mssql_reboot_should_run | bool
+  tags:
+    - reboot
+
+- name: Wait for WinRM after reboot
+  ansible.builtin.wait_for_connection:
+    timeout: "{{ mssql_reboot_timeout | default(3600) | int }}"
+    delay: "{{ mssql_post_reboot_delay | default(60) | int }}"
+  when:
+    - mssql_reboot_should_run | bool
+    - mssql_reboot_result is defined
+    - not (mssql_reboot_result is skipped)
+  tags:
+    - reboot
+
+- name: Confirm WinRM after reboot
+  ansible.windows.win_ping:
+  when:
+    - mssql_reboot_should_run | bool
+    - mssql_reboot_result is defined
+    - not (mssql_reboot_result is skipped)
+  tags:
+    - reboot
+
+- name: Set reboot outcome facts
+  ansible.builtin.set_fact:
+    pre_reboot_performed: >-
+      {{
+        (
+          (mssql_reboot_phase == 'pre')
+          and (mssql_reboot_should_run | bool)
+          and (mssql_reboot_result is defined)
+          and not (mssql_reboot_result is skipped)
+          and not (mssql_reboot_result is failed)
+        )
+        or (pre_reboot_performed | default(false) | bool)
+      }}
+    post_reboot_performed: >-
+      {{
+        (
+          (mssql_reboot_phase == 'post')
+          and (mssql_reboot_should_run | bool)
+          and (mssql_reboot_result is defined)
+          and not (mssql_reboot_result is skipped)
+          and not (mssql_reboot_result is failed)
+        )
+        or (post_reboot_performed | default(false) | bool)
+      }}
+    reboot_performed: >-
+      {{
+        (
+          (
+            (mssql_reboot_phase == 'pre')
+            and (mssql_reboot_should_run | bool)
+            and (mssql_reboot_result is defined)
+            and not (mssql_reboot_result is skipped)
+            and not (mssql_reboot_result is failed)
+          )
+          or (pre_reboot_performed | default(false) | bool)
+        )
+        or (
+          (
+            (mssql_reboot_phase == 'post')
+            and (mssql_reboot_should_run | bool)
+            and (mssql_reboot_result is defined)
+            and not (mssql_reboot_result is skipped)
+            and not (mssql_reboot_result is failed)
+          )
+          or (post_reboot_performed | default(false) | bool)
+        )
+      }}
+    reboot_required: >-
+      {{
+        (pending_reboot | default(false) | bool)
+        or (
+          (mssql_reboot_phase == 'post')
+          and (mssql_apply_reboot_required | default(false) | bool)
+        )
+      }}
+    manual_followup_required: >-
+      {{
+        (manual_followup_required | default(false) | bool)
+        or (
+          (
+            (pending_reboot | default(false) | bool)
+            or (mssql_apply_reboot_required | default(false) | bool)
+            or (mssql_reboot_mode_effective == 'always')
+          )
+          and (mssql_reboot_mode_effective == 'never')
+        )
+      }}
+  changed_when: false
+  tags:
+    - reboot

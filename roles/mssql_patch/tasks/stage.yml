@@ -1,0 +1,272 @@
+---
+# Stage installer to mssql_staging_dir; verify presence and checksum.
+
+- name: Initialize stage control facts
+  ansible.builtin.set_fact:
+    mssql_stage_failed: false
+    stage_status: pending
+  changed_when: false
+  tags:
+    - stage
+
+- name: Ensure staging directory exists
+  ansible.windows.win_file:
+    path: "{{ mssql_staging_dir }}"
+    state: directory
+  tags:
+    - stage
+
+- name: Derive staged installer path
+  ansible.builtin.set_fact:
+    mssql_installer_staged_path: "{{ mssql_staging_dir }}\\{{ mssql_definition_installer_filename }}"
+  changed_when: false
+  tags:
+    - stage
+
+- name: Stat staged installer
+  ansible.windows.win_stat:
+    path: "{{ mssql_installer_staged_path }}"
+    checksum_algorithm: "{{ mssql_definition_checksum_algorithm }}"
+    get_checksum: >-
+      {{
+        (mssql_require_installer_checksum | default(true) | bool)
+        or ((mssql_definition_checksum_value | default('') | length) > 0)
+      }}
+  register: mssql_installer_resolve_stat
+  tags:
+    - stage
+
+- name: Evaluate staged installer presence and checksum
+  ansible.builtin.set_fact:
+    mssql_installer_present: "{{ mssql_installer_resolve_stat.stat.exists | default(false) | bool }}"
+    mssql_installer_checksum_ok: >-
+      {{
+        true
+        if (
+          (mssql_definition_checksum_value | default('') | length) == 0
+          and not (mssql_require_installer_checksum | default(true) | bool)
+        )
+        else (
+          false
+          if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+          else (
+            false
+            if (
+              (mssql_require_installer_checksum | default(true) | bool)
+              and ((mssql_definition_checksum_value | default('') | length) == 0)
+            )
+            else (
+              true
+              if ((mssql_definition_checksum_value | default('') | length) == 0)
+              else (
+                (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+                == (mssql_definition_checksum_value | lower)
+              )
+            )
+          )
+        )
+      }}
+    mssql_installer_resolve_reason: >-
+      {{
+        'missing'
+        if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+        else (
+          'checksum_required_but_missing_in_definition'
+          if (
+            (mssql_require_installer_checksum | default(true) | bool)
+            and ((mssql_definition_checksum_value | default('') | length) == 0)
+          )
+          else (
+            'checksum_mismatch'
+            if (
+              ((mssql_definition_checksum_value | default('') | length) > 0)
+              and (
+                (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+                != (mssql_definition_checksum_value | lower)
+              )
+            )
+            else 'ok'
+          )
+        )
+      }}
+    mssql_stage_retransfer_needed: >-
+      {{
+        (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+        or (
+          not (
+            true
+            if (
+              (mssql_definition_checksum_value | default('') | length) == 0
+              and not (mssql_require_installer_checksum | default(true) | bool)
+            )
+            else (
+              false
+              if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+              else (
+                false
+                if (
+                  (mssql_require_installer_checksum | default(true) | bool)
+                  and ((mssql_definition_checksum_value | default('') | length) == 0)
+                )
+                else (
+                  true
+                  if ((mssql_definition_checksum_value | default('') | length) == 0)
+                  else (
+                    (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+                    == (mssql_definition_checksum_value | lower)
+                  )
+                )
+              )
+            )
+          )
+        )
+      }}
+  changed_when: false
+  tags:
+    - stage
+
+- name: Mark already staged when present and checksum OK
+  ansible.builtin.set_fact:
+    mssql_stage_retransfer_needed: false
+    stage_status: already_staged
+  when:
+    - mssql_installer_present | default(false) | bool
+    - mssql_installer_checksum_ok | default(false) | bool
+  changed_when: false
+  tags:
+    - stage
+
+- name: Block when transfer needed but source location unset
+  ansible.builtin.set_fact:
+    stage_status: failed
+    mssql_stage_failed: true
+    mssql_stage_failure_reason: >-
+      Installer must be staged but mssql_installer_source_location is empty
+      (reason={{ mssql_installer_resolve_reason | default('unknown') }}).
+  when:
+    - mssql_stage_retransfer_needed | default(false) | bool
+    - (mssql_installer_source_location | default('') | length) == 0
+  changed_when: false
+  tags:
+    - stage
+
+- name: Copy installer from enterprise source to staging directory
+  ansible.windows.win_copy:
+    src: "{{ mssql_installer_source_location }}/{{ mssql_definition_installer_filename }}"
+    dest: "{{ mssql_installer_staged_path }}"
+    remote_src: true
+  when:
+    - not (mssql_stage_failed | default(false) | bool)
+    - mssql_stage_retransfer_needed | default(false) | bool
+    - (mssql_installer_source_location | default('') | length) > 0
+  tags:
+    - stage
+
+- name: Re-stat staged installer after transfer
+  ansible.windows.win_stat:
+    path: "{{ mssql_installer_staged_path }}"
+    checksum_algorithm: "{{ mssql_definition_checksum_algorithm }}"
+    get_checksum: >-
+      {{
+        (mssql_require_installer_checksum | default(true) | bool)
+        or ((mssql_definition_checksum_value | default('') | length) > 0)
+      }}
+  register: mssql_installer_resolve_stat
+  when: not (mssql_stage_failed | default(false) | bool)
+  tags:
+    - stage
+
+- name: Re-evaluate staged installer after transfer
+  ansible.builtin.set_fact:
+    mssql_installer_present: "{{ mssql_installer_resolve_stat.stat.exists | default(false) | bool }}"
+    mssql_installer_checksum_ok: >-
+      {{
+        true
+        if (
+          (mssql_definition_checksum_value | default('') | length) == 0
+          and not (mssql_require_installer_checksum | default(true) | bool)
+        )
+        else (
+          false
+          if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+          else (
+            false
+            if (
+              (mssql_require_installer_checksum | default(true) | bool)
+              and ((mssql_definition_checksum_value | default('') | length) == 0)
+            )
+            else (
+              true
+              if ((mssql_definition_checksum_value | default('') | length) == 0)
+              else (
+                (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+                == (mssql_definition_checksum_value | lower)
+              )
+            )
+          )
+        )
+      }}
+    mssql_installer_resolve_reason: >-
+      {{
+        'missing'
+        if (not (mssql_installer_resolve_stat.stat.exists | default(false) | bool))
+        else (
+          'checksum_mismatch'
+          if (
+            ((mssql_definition_checksum_value | default('') | length) > 0)
+            and (
+              (mssql_installer_resolve_stat.stat.checksum | default('') | lower)
+              != (mssql_definition_checksum_value | lower)
+            )
+          )
+          else 'ok'
+        )
+      }}
+  when: not (mssql_stage_failed | default(false) | bool)
+  changed_when: false
+  tags:
+    - stage
+
+- name: Block when staged installer missing after stage
+  ansible.builtin.set_fact:
+    stage_status: failed
+    mssql_stage_failed: true
+    mssql_stage_failure_reason: >-
+      Staged installer missing at {{ mssql_installer_staged_path | default('') }}.
+  when:
+    - not (mssql_stage_failed | default(false) | bool)
+    - not (mssql_installer_present | default(false) | bool)
+  changed_when: false
+  tags:
+    - stage
+
+- name: Block when checksum mismatch after stage
+  ansible.builtin.set_fact:
+    stage_status: failed
+    mssql_stage_failed: true
+    mssql_stage_failure_reason: >-
+      Installer checksum mismatch for {{ mssql_installer_staged_path | default('') }}
+      (resolve_reason={{ mssql_installer_resolve_reason | default('') }}).
+  when:
+    - not (mssql_stage_failed | default(false) | bool)
+    - mssql_installer_present | default(false) | bool
+    - not (mssql_installer_checksum_ok | default(false) | bool)
+  changed_when: false
+  tags:
+    - stage
+
+- name: Set stage_status success when not already set
+  ansible.builtin.set_fact:
+    stage_status: >-
+      {{
+        stage_status
+        if (stage_status | default('') in ['already_staged', 'failed'])
+        else (
+          'skipped_retransfer'
+          if (not (mssql_stage_retransfer_needed | default(true) | bool))
+          else 'staged'
+        )
+      }}
+  changed_when: false
+  tags:
+    - stage

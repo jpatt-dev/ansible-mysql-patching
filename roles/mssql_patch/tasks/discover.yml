@@ -1,0 +1,515 @@
+---
+# SQL instance discovery, applicability, and instance_scope targeting.
+
+- name: Probe WinRM connectivity
+  ansible.windows.win_ping:
+  register: mssql_win_ping
+  failed_when: false
+  ignore_unreachable: true
+  tags:
+    - discovery
+
+- name: Set connectivity fact
+  ansible.builtin.set_fact:
+    mssql_connectivity_ok: >-
+      {{
+        not (
+          (mssql_win_ping.failed | default(false) | bool)
+          or (mssql_win_ping.unreachable | default(false) | bool)
+        )
+      }}
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Soft-fail when host is unreachable during discovery
+  ansible.builtin.set_fact:
+    mssql_instances: []
+    mssql_instances_in_scope: []
+    mssql_instances_targeted: []
+    mssql_instances_needing_patch: []
+    mssql_instances_already_compliant: []
+    mssql_instances_blocked: []
+    mssql_instances_not_applicable: []
+    mssql_topology:
+      is_clustered: false
+      is_hadr_enabled: false
+    mssql_discovery_status: failed
+  when: not (mssql_connectivity_ok | bool)
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Discover SQL Server instances from Windows registry
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Stop'
+    $instances = @()
+    $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+    if (-not (Test-Path $base)) {
+      @{ instances = @(); error = 'Instance Names\SQL registry key not found' } | ConvertTo-Json -Compress
+      exit 0
+    }
+    $names = Get-ItemProperty -Path $base
+    foreach ($prop in $names.PSObject.Properties) {
+      if ($prop.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+      $instanceName = $prop.Name
+      $instanceId = [string]$prop.Value
+      $setupKey = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$instanceId\Setup"
+      $version = $null
+      $edition = $null
+      if (Test-Path $setupKey) {
+        $setup = Get-ItemProperty -Path $setupKey -ErrorAction SilentlyContinue
+        $version = $setup.Version
+        $edition = $setup.Edition
+      }
+      $svcName = if ($instanceName -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$instanceName" }
+      $agentName = if ($instanceName -eq 'MSSQLSERVER') { 'SQLSERVERAGENT' } else { "SQLAgent`$$instanceName" }
+      $instances += [ordered]@{
+        instance_id = $instanceId
+        instance_name = $instanceName
+        is_default = ($instanceName -eq 'MSSQLSERVER')
+        service_name = $svcName
+        agent_service_name = $agentName
+        registry_version = $version
+        edition = $edition
+      }
+    }
+    @{ instances = $instances; error = $null } | ConvertTo-Json -Compress -Depth 6
+  register: mssql_registry_discovery
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Parse registry discovery JSON
+  ansible.builtin.set_fact:
+    mssql_registry_payload: "{{ mssql_registry_discovery.stdout | default('{}') | from_json }}"
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Initialize instance list from registry
+  ansible.builtin.set_fact:
+    mssql_instances_raw: "{{ mssql_registry_payload.instances | default([]) }}"
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Query SERVERPROPERTY for each discovered instance
+  ansible.windows.win_shell: |
+    $ErrorActionPreference = 'Continue'
+    $instanceName = '{{ item.instance_name }}'
+    $server = if ($instanceName -eq 'MSSQLSERVER') { 'localhost' } else { "localhost\$instanceName" }
+    $query = @"
+    SET NOCOUNT ON;
+    SELECT
+      CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS ProductVersion,
+      CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS ProductLevel,
+      CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(128)) AS ProductUpdateLevel,
+      CAST(SERVERPROPERTY('ProductUpdateReference') AS nvarchar(128)) AS ProductUpdateReference,
+      CAST(SERVERPROPERTY('IsClustered') AS int) AS IsClustered,
+      CAST(SERVERPROPERTY('IsHadrEnabled') AS int) AS IsHadrEnabled,
+      CAST(SERVERPROPERTY('ProductMajorVersion') AS int) AS ProductMajorVersion;
+    "@
+    $sqlcmdExe = '{{ mssql_sqlcmd_path }}'
+    $sqlcmd = Get-Command $sqlcmdExe -ErrorAction SilentlyContinue
+    if (-not $sqlcmd) {
+      @{ ok = $false; error = ("sqlcmd not found: " + $sqlcmdExe) } | ConvertTo-Json -Compress
+      exit 0
+    }
+    $out = & $sqlcmdExe -S $server -E -h -1 -W -s '|' -Q $query 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      @{ ok = $false; error = ($out | Out-String).Trim(); server = $server } | ConvertTo-Json -Compress
+      exit 0
+    }
+    $line = ($out | Where-Object { $_ -and ($_ -as [string]).Trim() -ne '' } | Select-Object -First 1)
+    if (-not $line) {
+      @{ ok = $false; error = 'empty SERVERPROPERTY result'; server = $server } | ConvertTo-Json -Compress
+      exit 0
+    }
+    $parts = ($line -as [string]).Split('|') | ForEach-Object { $_.Trim() }
+    while ($parts.Count -lt 7) { $parts += '' }
+    $updateLevel = $parts[2]
+    # Conservative CU/GDR inference only. Do not invent Microsoft relationships.
+    # ProductUpdateLevel must match ^CU/^GDR; unknown fails closed.
+    $branch = 'unknown'
+    if ($updateLevel -match '^CU') { $branch = 'CU' }
+    elseif ($updateLevel -match '^GDR') { $branch = 'GDR' }
+    @{
+      ok = $true
+      product_version = $parts[0]
+      product_level = $parts[1]
+      product_update_level = $parts[2]
+      product_update_reference = $parts[3]
+      is_clustered = ([int]($parts[4] -as [string]) -eq 1)
+      is_hadr_enabled = ([int]($parts[5] -as [string]) -eq 1)
+      major_version = ($parts[6] -as [int])
+      servicing_branch_inferred = $branch
+      server = $server
+    } | ConvertTo-Json -Compress
+  loop: "{{ mssql_instances_raw | default([]) }}"
+  loop_control:
+    label: "{{ item.instance_name }}"
+  register: mssql_serverproperty_results
+  when:
+    - mssql_connectivity_ok | bool
+    - (mssql_instances_raw | default([]) | length) > 0
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Initialize merged instance list before SERVERPROPERTY merge
+  ansible.builtin.set_fact:
+    mssql_instances: []
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Merge registry and SERVERPROPERTY into mssql_instances
+  ansible.builtin.set_fact:
+    mssql_instances: >-
+      {{
+        mssql_instances | default([])
+        + [
+          {
+            'instance_id': item.item.instance_id,
+            'instance_name': item.item.instance_name,
+            'is_default': item.item.is_default,
+            'service_name': item.item.service_name,
+            'agent_service_name': item.item.agent_service_name,
+            'registry_version': item.item.registry_version,
+            'edition': item.item.edition,
+            'version': {
+              'product_version': (item.stdout | default('{}') | from_json).product_version | default(''),
+              'product_level': (item.stdout | default('{}') | from_json).product_level | default(''),
+              'product_update_level': (item.stdout | default('{}') | from_json).product_update_level | default(''),
+              'product_update_reference': (item.stdout | default('{}') | from_json).product_update_reference | default(''),
+              'major_version': (item.stdout | default('{}') | from_json).major_version | default(0),
+              'servicing_branch_inferred': (item.stdout | default('{}') | from_json).servicing_branch_inferred | default('unknown')
+            },
+            'cluster': {
+              'is_clustered': (item.stdout | default('{}') | from_json).is_clustered | default(false)
+            },
+            'hadr': {
+              'is_hadr_enabled': (item.stdout | default('{}') | from_json).is_hadr_enabled | default(false)
+            },
+            'probe_ok': (item.stdout | default('{}') | from_json).ok | default(false),
+            'probe_error': (item.stdout | default('{}') | from_json).error | default('')
+          }
+        ]
+      }}
+  loop: "{{ mssql_serverproperty_results.results | default([]) }}"
+  when:
+    - mssql_connectivity_ok | bool
+    - mssql_serverproperty_results is defined
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Initialize empty instances when none discovered
+  ansible.builtin.set_fact:
+    mssql_instances: []
+  when:
+    - mssql_connectivity_ok | bool
+    - (mssql_instances_raw | default([]) | length) == 0
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Derive host topology from instances
+  ansible.builtin.set_fact:
+    mssql_topology:
+      is_clustered: "{{ (mssql_instances | map(attribute='cluster.is_clustered') | select | list | length) > 0 }}"
+      is_hadr_enabled: "{{ (mssql_instances | map(attribute='hadr.is_hadr_enabled') | select | list | length) > 0 }}"
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+# AG/FCI always blocks remediation until explicit sequencing is implemented.
+- name: Evaluate AG/FCI fail-closed topology gate
+  ansible.builtin.set_fact:
+    mssql_topology_blocked: >-
+      {{
+        (mssql_topology.is_clustered | default(false) | bool)
+        or (mssql_topology.is_hadr_enabled | default(false) | bool)
+      }}
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Build applicability-enriched instance list
+  ansible.builtin.set_fact:
+    mssql_instances_enriched: []
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Enrich each instance with applicability status
+  ansible.builtin.set_fact:
+    mssql_instances_enriched: >-
+      {{
+        mssql_instances_enriched
+        + [
+          item | combine({
+            'applicability': {
+              'status': (
+                'out_of_scope'
+                if ((item.version.major_version | int) != (mssql_definition_sql_product_major_version | int))
+                else (
+                  'blocked'
+                  if (mssql_topology_blocked | bool)
+                  else (
+                    'blocked'
+                    if (not (item.probe_ok | default(false) | bool))
+                    else (
+                      'blocked'
+                      if ((item.version.servicing_branch_inferred | default('unknown')) == 'unknown')
+                      else (
+                        'blocked'
+                        if ((item.version.servicing_branch_inferred | upper) != (mssql_definition_servicing_branch | upper))
+                        else (
+                          'already_compliant'
+                          if ((item.version.product_version | string) is version(mssql_definition_target_build, '=='))
+                          else (
+                            'blocked'
+                            if ((item.version.product_version | string) is version(mssql_definition_target_build, '>'))
+                            else (
+                              'not_applicable'
+                              if (
+                                (mssql_definition_allowed_source_builds | default([]) | length > 0)
+                                and (item.version.product_version not in (mssql_definition_allowed_source_builds | default([])))
+                              )
+                              else 'applicable'
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              ),
+              'reason': (
+                'sql_product_major_version differs from patch definition — out of scope for this KB'
+                if ((item.version.major_version | int) != (mssql_definition_sql_product_major_version | int))
+                else (
+                  'AG/FCI detected — remediation blocked (no failover sequencing)'
+                  if (mssql_topology_blocked | bool)
+                  else (
+                    item.probe_error | default('SERVERPROPERTY probe failed')
+                    if (not (item.probe_ok | default(false) | bool))
+                    else (
+                      'servicing_branch_inferred is unknown — fail closed'
+                      if ((item.version.servicing_branch_inferred | default('unknown')) == 'unknown')
+                      else (
+                        'servicing_branch mismatch (CU/GDR safety)'
+                        if ((item.version.servicing_branch_inferred | upper) != (mssql_definition_servicing_branch | upper))
+                        else (
+                          'already at target_build'
+                          if ((item.version.product_version | string) is version(mssql_definition_target_build, '=='))
+                          else (
+                            'installed build is newer than requested target'
+                            if ((item.version.product_version | string) is version(mssql_definition_target_build, '>'))
+                            else (
+                              'current build not in allowed_source_builds'
+                              if (
+                                (mssql_definition_allowed_source_builds | default([]) | length > 0)
+                                and (item.version.product_version not in (mssql_definition_allowed_source_builds | default([])))
+                              )
+                              else 'build is applicable for requested KB'
+                            )
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              ),
+              'target_build': mssql_definition_target_build,
+              'pre_build': item.version.product_version | default('')
+            }
+          })
+        ]
+      }}
+  loop: "{{ mssql_instances | default([]) }}"
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Publish enriched instances
+  ansible.builtin.set_fact:
+    mssql_instances: "{{ mssql_instances_enriched | default([]) }}"
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Normalize instance_scope from definition
+  ansible.builtin.set_fact:
+    mssql_definition_instance_scope: "{{ mssql_definition_instance_scope | default('all_instances') | trim | lower }}"
+    mssql_definition_instance_names: "{{ mssql_definition_instance_names | default([]) }}"
+    mssql_instance_scope_blocked: false
+    mssql_instance_scope_block_reason: ""
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Build major-version in-scope instance list
+  ansible.builtin.set_fact:
+    mssql_instances_in_scope: >-
+      {{
+        mssql_instances | default([])
+        | rejectattr('applicability.status', 'equalto', 'out_of_scope')
+        | list
+      }}
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Block unsupported instance_scope values
+  ansible.builtin.set_fact:
+    mssql_instance_scope_blocked: true
+    mssql_instance_scope_block_reason: >-
+      Unsupported installer.instance_scope='{{ mssql_definition_instance_scope }}'.
+      Allowed: all_instances, named.
+    mssql_instances_targeted: []
+  when: mssql_definition_instance_scope not in ['all_instances', 'named']
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Target all in-scope instances for all_instances scope
+  ansible.builtin.set_fact:
+    mssql_instances_targeted: "{{ mssql_instances_in_scope | default([]) }}"
+  when:
+    - not (mssql_instance_scope_blocked | default(false) | bool)
+    - mssql_definition_instance_scope == 'all_instances'
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Block named scope without exactly one instance name
+  ansible.builtin.set_fact:
+    mssql_instance_scope_blocked: true
+    mssql_instance_scope_block_reason: >-
+      installer.instance_scope=named requires installer.instance_names with
+      exactly one instance name.
+    mssql_instances_targeted: []
+  when:
+    - not (mssql_instance_scope_blocked | default(false) | bool)
+    - mssql_definition_instance_scope == 'named'
+    - (mssql_definition_instance_names | default([]) | length) != 1
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Resolve single named target instance
+  ansible.builtin.set_fact:
+    mssql_instances_targeted: >-
+      {{
+        mssql_instances_in_scope | default([])
+        | selectattr('instance_name', 'equalto', (mssql_definition_instance_names | first))
+        | list
+      }}
+  when:
+    - not (mssql_instance_scope_blocked | default(false) | bool)
+    - mssql_definition_instance_scope == 'named'
+    - (mssql_definition_instance_names | default([]) | length) == 1
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Block named scope when instance not found in-scope
+  ansible.builtin.set_fact:
+    mssql_instance_scope_blocked: true
+    mssql_instance_scope_block_reason: >-
+      Named instance '{{ mssql_definition_instance_names | first | default('') }}'
+      was not found among in-scope SQL instances for this major version.
+  when:
+    - not (mssql_instance_scope_blocked | bool)
+    - mssql_definition_instance_scope == 'named'
+    - (mssql_definition_instance_names | default([]) | length) == 1
+    - (mssql_instances_targeted | default([]) | length) == 0
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Build instance summary lists from targeted set
+  ansible.builtin.set_fact:
+    mssql_instances_needing_patch: >-
+      {{ mssql_instances_targeted | default([]) | selectattr('applicability.status', 'equalto', 'applicable') | list }}
+    mssql_instances_already_compliant: >-
+      {{ mssql_instances_targeted | default([]) | selectattr('applicability.status', 'equalto', 'already_compliant') | list }}
+    mssql_instances_blocked: >-
+      {{ mssql_instances_targeted | default([]) | selectattr('applicability.status', 'equalto', 'blocked') | list }}
+    mssql_instances_not_applicable: >-
+      {{ mssql_instances_targeted | default([]) | selectattr('applicability.status', 'equalto', 'not_applicable') | list }}
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Derive mssql_discovery_status (does not overwrite Apply patch_status)
+  ansible.builtin.set_fact:
+    mssql_discovery_status: >-
+      {{
+        'failed'
+        if (not (mssql_connectivity_ok | bool))
+        else (
+          'blocked'
+          if (
+            (mssql_instance_scope_blocked | default(false) | bool)
+            or (mssql_topology_blocked | bool)
+            or ((mssql_instances_blocked | default([]) | length) > 0)
+            or ((mssql_instances_not_applicable | default([]) | length) > 0)
+          )
+          else (
+            'already_compliant'
+            if (
+              (mssql_instances_needing_patch | default([]) | length) == 0
+              and (mssql_instances_already_compliant | default([]) | length) > 0
+            )
+            else (
+              'not_applicable'
+              if ((mssql_instances_targeted | default([]) | length) == 0)
+              else 'ok'
+            )
+          )
+        )
+      }}
+  changed_when: false
+  tags:
+    - discovery
+
+- name: Check Windows pending reboot indicators
+  ansible.windows.win_shell: |
+    $pending = $false
+    $reasons = @()
+    $cbs = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    $wu = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    $sm = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+    if (Test-Path $cbs) { $pending = $true; $reasons += 'CBS_RebootPending' }
+    if (Test-Path $wu) { $pending = $true; $reasons += 'WU_RebootRequired' }
+    try {
+      $pv = (Get-ItemProperty -Path $sm -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+      if ($pv) { $pending = $true; $reasons += 'PendingFileRenameOperations' }
+    } catch {}
+    @{ pending_reboot = $pending; reasons = $reasons } | ConvertTo-Json -Compress
+  register: mssql_pending_reboot_raw
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  failed_when: false
+  tags:
+    - discovery
+
+- name: Set pending_reboot fact
+  ansible.builtin.set_fact:
+    pending_reboot: "{{ (mssql_pending_reboot_raw.stdout | default('{}') | from_json).pending_reboot | default(false) | bool }}"
+    pending_reboot_reasons: "{{ (mssql_pending_reboot_raw.stdout | default('{}') | from_json).reasons | default([]) }}"
+  when: mssql_connectivity_ok | bool
+  changed_when: false
+  tags:
+    - discovery
+ 

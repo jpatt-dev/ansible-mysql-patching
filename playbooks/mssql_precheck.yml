@@ -1,0 +1,8 @@
+---
+- name: MSSQL precheck
+  hosts: mssql_hosts
+  gather_facts: false
+  vars:
+    mssql_execute_patch: false
+  roles:
+    - role: mssql_patch

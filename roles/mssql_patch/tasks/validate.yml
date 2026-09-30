@@ -1,5 +1,5 @@
 ---
-# Limit safety, inventory exception, load and normalize vars/mssql_patches/<id>.yml
+# Limit safety, inventory exception, validate runtime patch inputs, build mssql_patch_definition
 
 - name: Derive inventory patch exemption
   ansible.builtin.set_fact:
@@ -37,108 +37,130 @@
   when: patch_require_explicit_limit | default(true) | bool
   run_once: true
 
-- name: Resolve patch definition id
+- name: Normalize runtime patch inputs
   ansible.builtin.set_fact:
-    mssql_patch_definition_id_effective: "{{ mssql_patch_definition_id | default('') | trim }}"
+    mssql_input_kb_id: "{{ mssql_kb_id | default('') | string | trim | upper }}"
+    mssql_input_sql_product_major_version: "{{ mssql_sql_product_major_version | default('') | string | trim }}"
+    mssql_input_servicing_branch: "{{ mssql_servicing_branch | default('') | string | trim | upper }}"
+    mssql_input_target_build: "{{ mssql_target_build | default('') | string | trim }}"
+    mssql_input_installer_filename: "{{ mssql_installer_filename | default('') | string | trim }}"
+    mssql_input_installer_sha256: "{{ mssql_installer_sha256 | default('') | string | trim | lower }}"
   changed_when: false
 
-- name: Require mssql_patch_definition_id
+- name: Validate mssql_kb_id
   ansible.builtin.assert:
     that:
-      - (mssql_patch_definition_id_effective | length) > 0
-    fail_msg: mssql_patch_definition_id is required (basename under vars/mssql_patches/).
-
-- name: Validate mssql_patch_definition_id characters
-  ansible.builtin.assert:
-    that:
-      - mssql_patch_definition_id_effective is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+      - mssql_input_kb_id is match('^KB[0-9]{6,8}$')
     fail_msg: >-
-      mssql_patch_definition_id must match ^[A-Za-z0-9][A-Za-z0-9_-]*$
-      (got '{{ mssql_patch_definition_id_effective }}').
+      mssql_kb_id must be a Microsoft KB identifier such as KB1234567
+      (got '{{ mssql_kb_id | default('') }}').
 
-- name: Resolve patch definition search paths
-  ansible.builtin.set_fact:
-    mssql_patch_definitions_search_paths:
-      - "{{ mssql_patch_definitions_dir }}"
-      - "{{ playbook_dir }}/../vars/mssql_patches"
-      - "{{ role_path }}/../../vars/mssql_patches"
-  changed_when: false
-  run_once: true
-
-- name: Find patch definition file
-  ansible.builtin.set_fact:
-    mssql_patch_definition_file: >-
-      {{
-        lookup(
-          'first_found',
-          {
-            'files': [
-              mssql_patch_definition_id_effective ~ '.yml',
-              mssql_patch_definition_id_effective ~ '.yaml'
-            ],
-            'paths': mssql_patch_definitions_search_paths,
-            'skip': true
-          }
-        )
-      }}
-  changed_when: false
-  run_once: true
-
-- name: Fail when patch definition is missing
+- name: Validate mssql_sql_product_major_version
   ansible.builtin.assert:
     that:
-      - (mssql_patch_definition_file | default('') | length) > 0
+      - mssql_input_sql_product_major_version is match('^[0-9]{2}$')
+      - (mssql_input_sql_product_major_version | int) >= 10
     fail_msg: >-
-      Patch definition '{{ mssql_patch_definition_id_effective }}' not found under
-      vars/mssql_patches/ (searched: {{ mssql_patch_definitions_search_paths | join(', ') }}).
+      mssql_sql_product_major_version must be SERVERPROPERTY('ProductMajorVersion')
+      as an integer (13=2016, 14=2017, 15=2019, 16=2022, 17=2025), not a marketing year
+      (got '{{ mssql_sql_product_major_version | default('') }}').
 
-- name: Load patch definition YAML
-  ansible.builtin.set_fact:
-    mssql_patch_definition: "{{ lookup('file', mssql_patch_definition_file) | from_yaml }}"
-  changed_when: false
-  run_once: true
-
-- name: Validate required patch definition fields
+- name: Validate mssql_servicing_branch
   ansible.builtin.assert:
     that:
-      - mssql_patch_definition.kb_id is defined
-      - (mssql_patch_definition.kb_id | string | length) > 0
-      - mssql_patch_definition.sql_product_major_version is defined
-      - mssql_patch_definition.servicing_branch is defined
-      - (mssql_patch_definition.servicing_branch | upper) in ['CU', 'GDR']
-      - mssql_patch_definition.target_build is defined
-      - (mssql_patch_definition.target_build | string | length) > 0
-      - mssql_patch_definition.platform is defined
-      - (mssql_patch_definition.platform | string | lower) == 'windows'
-      - mssql_patch_definition.installer is defined
-      - mssql_patch_definition.installer.filename is defined
-      - (mssql_patch_definition.installer.filename | string | length) > 0
-      - >
-          not (mssql_require_installer_checksum | default(true) | bool)
-          or (
-            (mssql_patch_definition.installer.checksum.algorithm | default('') | length) > 0
-            and (mssql_patch_definition.installer.checksum.value | default('') | length) > 0
-          )
+      - mssql_input_servicing_branch in ['CU', 'GDR']
     fail_msg: >-
-      Patch definition '{{ mssql_patch_definition_file }}' missing required fields
-      (kb_id, sql_product_major_version, servicing_branch CU|GDR, target_build,
-      platform=windows, installer.filename, and checksum when required).
+      mssql_servicing_branch must be CU or GDR
+      (got '{{ mssql_servicing_branch | default('') }}').
+
+- name: Validate mssql_target_build
+  ansible.builtin.assert:
+    that:
+      - mssql_input_target_build is match('^[0-9]{1,4}(\.[0-9]{1,6}){2,3}$')
+      - (mssql_input_target_build.split('.') | first | int) == (mssql_input_sql_product_major_version | int)
+    fail_msg: >-
+      mssql_target_build must be a dotted numeric SQL Server build (e.g. 16.0.4135.4)
+      whose major component matches mssql_sql_product_major_version
+      (got '{{ mssql_target_build | default('') }}').
+
+- name: Validate mssql_installer_filename
+  ansible.builtin.assert:
+    that:
+      - mssql_input_installer_filename is match('^[A-Za-z0-9][A-Za-z0-9._-]*\.[Ee][Xx][Ee]$')
+      - "'..' not in mssql_input_installer_filename"
+    fail_msg: >-
+      mssql_installer_filename must be a bare .exe filename with no path, drive letter,
+      slash, backslash, or '..' (got '{{ mssql_installer_filename | default('') }}').
+
+- name: Validate mssql_installer_sha256
+  ansible.builtin.assert:
+    that:
+      - mssql_input_installer_sha256 is match('^[0-9a-f]{64}$')
+    fail_msg: mssql_installer_sha256 must be exactly 64 hexadecimal characters.
+
+- name: Build normalized patch definition from runtime inputs
+  ansible.builtin.set_fact:
+    mssql_patch_definition:
+      kb_id: "{{ mssql_input_kb_id }}"
+      sql_product_major_version: "{{ mssql_input_sql_product_major_version | int }}"
+      platform: windows
+      servicing_branch: "{{ mssql_input_servicing_branch }}"
+      target_build: "{{ mssql_input_target_build }}"
+      installer:
+        filename: "{{ mssql_input_installer_filename }}"
+        checksum:
+          algorithm: sha256
+          value: "{{ mssql_input_installer_sha256 }}"
+        instance_scope: all_instances
+        instance_names: []
+        extra_arguments: []
+        success_return_codes:
+          - 0
+        reboot_return_codes:
+          - 3010
+      current_build_requirements:
+        allowed_source_builds: []
+      validation_rules:
+        verify_databases: true
+  changed_when: false
 
 - name: Normalize definition facts
   ansible.builtin.set_fact:
     kb_id: "{{ mssql_patch_definition.kb_id }}"
     mssql_definition_sql_product_major_version: "{{ mssql_patch_definition.sql_product_major_version | int }}"
-    mssql_definition_servicing_branch: "{{ mssql_patch_definition.servicing_branch | upper }}"
-    mssql_definition_target_build: "{{ mssql_patch_definition.target_build | string }}"
-    mssql_definition_platform: "{{ mssql_patch_definition.platform | string | lower }}"
+    mssql_definition_servicing_branch: "{{ mssql_patch_definition.servicing_branch }}"
+    mssql_definition_target_build: "{{ mssql_patch_definition.target_build }}"
+    mssql_definition_platform: "{{ mssql_patch_definition.platform }}"
     mssql_definition_installer_filename: "{{ mssql_patch_definition.installer.filename }}"
-    mssql_definition_checksum_algorithm: "{{ mssql_patch_definition.installer.checksum.algorithm | default('sha256') }}"
-    mssql_definition_checksum_value: "{{ mssql_patch_definition.installer.checksum.value | default('') }}"
-    mssql_definition_success_rcs: "{{ mssql_patch_definition.installer.success_return_codes | default([0]) }}"
-    mssql_definition_reboot_rcs: "{{ mssql_patch_definition.installer.reboot_return_codes | default([3010]) }}"
-    mssql_definition_instance_scope: "{{ mssql_patch_definition.installer.instance_scope | default('all_instances') | trim | lower }}"
-    mssql_definition_instance_names: "{{ mssql_patch_definition.installer.instance_names | default([]) }}"
-    mssql_definition_extra_arguments: "{{ mssql_patch_definition.installer.extra_arguments | default([]) }}"
-    mssql_definition_allowed_source_builds: "{{ mssql_patch_definition.current_build_requirements.allowed_source_builds | default([]) }}"
-    mssql_definition_verify_databases: "{{ mssql_patch_definition.validation_rules.verify_databases | default(true) | bool }}"
+    mssql_definition_checksum_algorithm: "{{ mssql_patch_definition.installer.checksum.algorithm }}"
+    mssql_definition_checksum_value: "{{ mssql_patch_definition.installer.checksum.value }}"
+    mssql_definition_success_rcs: "{{ mssql_patch_definition.installer.success_return_codes }}"
+    mssql_definition_reboot_rcs: "{{ mssql_patch_definition.installer.reboot_return_codes }}"
+    mssql_definition_instance_scope: "{{ mssql_patch_definition.installer.instance_scope }}"
+    mssql_definition_instance_names: "{{ mssql_patch_definition.installer.instance_names }}"
+    mssql_definition_extra_arguments: "{{ mssql_patch_definition.installer.extra_arguments }}"
+    mssql_definition_allowed_source_builds: "{{ mssql_patch_definition.current_build_requirements.allowed_source_builds }}"
+    mssql_definition_verify_databases: "{{ mssql_patch_definition.validation_rules.verify_databases | bool }}"
   changed_when: false
+
+- name: Assert locked definition values were not overridden at launch
+  ansible.builtin.assert:
+    that:
+      - kb_id == mssql_input_kb_id
+      - (mssql_definition_sql_product_major_version | int) == (mssql_input_sql_product_major_version | int)
+      - mssql_definition_servicing_branch == mssql_input_servicing_branch
+      - mssql_definition_target_build == mssql_input_target_build
+      - mssql_definition_installer_filename == mssql_input_installer_filename
+      - mssql_definition_checksum_value == mssql_input_installer_sha256
+      - mssql_definition_platform == 'windows'
+      - mssql_definition_checksum_algorithm == 'sha256'
+      - (mssql_definition_success_rcs | map('int') | list) == [0]
+      - (mssql_definition_reboot_rcs | map('int') | list) == [3010]
+      - mssql_definition_instance_scope == 'all_instances'
+      - (mssql_definition_instance_names | length) == 0
+      - (mssql_definition_extra_arguments | length) == 0
+      - (mssql_definition_allowed_source_builds | length) == 0
+      - mssql_definition_verify_databases | bool
+    fail_msg: >-
+      Locked MSSQL patch definition values differ from code-owned values.
+      Do not pass mssql_patch_definition or mssql_definition_* as extra vars.

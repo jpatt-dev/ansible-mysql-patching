@@ -20,7 +20,11 @@
           'host': inventory_hostname,
           'kb_id': kb_id | default(''),
           'run_id': mssql_run_id | default(''),
+          'sql_product_major_version': mssql_patch_definition.sql_product_major_version | default(''),
+          'servicing_branch': mssql_patch_definition.servicing_branch | default(''),
           'target_build': mssql_definition_target_build | default(''),
+          'installer_filename': mssql_patch_definition.installer.filename | default(''),
+          'installer_sha256': mssql_patch_definition.installer.checksum.value | default(''),
           'change_ticket_id': change_ticket_id | default(''),
           'patch_attempted': patch_attempted | default(false),
           'patch_status': patch_status | default('not_attempted'),
@@ -127,7 +131,11 @@
       change_ticket_id: "{{ change_ticket_id | default('') }}"
       kb_id: "{{ kb_id | default('') }}"
       run_id: "{{ mssql_run_id | default('') }}"
+      sql_product_major_version: "{{ mssql_patch_definition.sql_product_major_version | default('') }}"
+      servicing_branch: "{{ mssql_patch_definition.servicing_branch | default('') }}"
       target_build: "{{ mssql_definition_target_build | default('') }}"
+      installer_filename: "{{ mssql_patch_definition.installer.filename | default('') }}"
+      installer_sha256: "{{ mssql_patch_definition.installer.checksum.value | default('') }}"
       pre_builds: "{{ mssql_pre_builds | default([]) }}"
       post_builds: "{{ mssql_post_builds | default([]) }}"
       instances_targeted: "{{ mssql_instances_targeted | default([]) | map(attribute='instance_name') | list }}"

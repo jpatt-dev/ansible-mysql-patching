@@ -1,0 +1,222 @@
+---
+# Read-only MSSQL diagnostic: WinRM, sqlcmd, SQL instances, services, SERVERPROPERTY, disks.
+
+- name: MSSQL diagnostic
+  hosts: mssql_hosts
+  gather_facts: false
+  vars:
+    mssql_test_sqlcmd: "{{ mssql_sqlcmd_path | default('sqlcmd') }}"
+  tasks:
+    - name: Check WinRM connectivity
+      block:
+        - name: Ping Windows host
+          ansible.windows.win_ping:
+          register: mssql_test_ping
+          ignore_unreachable: true
+          failed_when: false
+      rescue:
+        - name: Record WinRM connection failure
+          ansible.builtin.set_fact:
+            mssql_test_ping: "{{ ansible_failed_result }}"
+
+    - name: Set connectivity status
+      ansible.builtin.set_fact:
+        mssql_test_winrm_ok: "{{ (mssql_test_ping.ping | default('')) == 'pong' }}"
+        mssql_test_winrm_error: >-
+          {{
+            ''
+            if ((mssql_test_ping.ping | default('')) == 'pong')
+            else ((mssql_test_ping.msg | default('WinRM connection failed') | string | trim)[:300])
+          }}
+        mssql_test_instances: []
+
+    - name: Locate sqlcmd
+      ansible.windows.win_shell: |
+        $cmd = Get-Command -Name '{{ mssql_test_sqlcmd_ps }}' -CommandType Application -ErrorAction SilentlyContinue |
+          Select-Object -First 1
+        if ($cmd) {
+          @{ available = $true; path = [string]$cmd.Source } | ConvertTo-Json -Compress
+        } else {
+          @{ available = $false; path = '' } | ConvertTo-Json -Compress
+        }
+      vars:
+        mssql_test_sqlcmd_ps: "{{ mssql_test_sqlcmd | replace(\"'\", \"''\") }}"
+      register: mssql_test_sqlcmd_raw
+      when: mssql_test_winrm_ok | bool
+      changed_when: false
+      failed_when: false
+
+    - name: Discover SQL Server instances from Windows registry
+      ansible.windows.win_shell: |
+        $base = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+        if (-not (Test-Path $base)) {
+          @{ instances = @(); error = 'No SQL Server instances found (Instance Names\SQL registry key not present)' } |
+            ConvertTo-Json -Compress
+          exit 0
+        }
+        $instances = @()
+        $names = Get-ItemProperty -Path $base
+        foreach ($prop in $names.PSObject.Properties) {
+          if ($prop.Name -in @('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')) { continue }
+          $instanceName = $prop.Name
+          $instances += [ordered]@{
+            instance_name = $instanceName
+            instance_id   = [string]$prop.Value
+            server_name   = if ($instanceName -eq 'MSSQLSERVER') { 'localhost' } else { "localhost\$instanceName" }
+          }
+        }
+        $err = if ($instances.Count -eq 0) { 'No SQL Server instances found in registry' } else { $null }
+        @{ instances = $instances; error = $err } | ConvertTo-Json -Compress -Depth 4
+      register: mssql_test_registry_raw
+      when: mssql_test_winrm_ok | bool
+      changed_when: false
+      failed_when: false
+
+    - name: Collect SQL Server and SQL Agent services
+      ansible.windows.win_shell: |
+        $services = @(
+          Get-Service -Name 'MSSQLSERVER', 'MSSQL$*', 'SQLSERVERAGENT', 'SQLAgent$*' -ErrorAction SilentlyContinue |
+            Sort-Object Name |
+            ForEach-Object {
+              [ordered]@{ name = $_.Name; display_name = $_.DisplayName; status = [string]$_.Status }
+            }
+        )
+        @{ services = $services } | ConvertTo-Json -Compress -Depth 4
+      register: mssql_test_services_raw
+      when: mssql_test_winrm_ok | bool
+      changed_when: false
+      failed_when: false
+
+    - name: Collect fixed disk space
+      ansible.windows.win_shell: |
+        $disks = @(
+          Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType=3' |
+            Sort-Object DeviceID |
+            ForEach-Object {
+              [ordered]@{
+                drive   = $_.DeviceID
+                free_gb = [math]::Round($_.FreeSpace / 1GB, 1)
+                size_gb = [math]::Round($_.Size / 1GB, 1)
+              }
+            }
+        )
+        @{ disks = $disks } | ConvertTo-Json -Compress -Depth 4
+      register: mssql_test_disks_raw
+      when: mssql_test_winrm_ok | bool
+      changed_when: false
+      failed_when: false
+
+    - name: Parse host discovery output
+      ansible.builtin.set_fact:
+        mssql_test_sqlcmd_info: >-
+          {{
+            (mssql_test_sqlcmd_raw.stdout | from_json)
+            if ((mssql_test_sqlcmd_raw.stdout | default('') | trim) is match('^\{'))
+            else {'available': false, 'path': ''}
+          }}
+        mssql_test_registry: >-
+          {{
+            (mssql_test_registry_raw.stdout | from_json)
+            if ((mssql_test_registry_raw.stdout | default('') | trim) is match('^\{'))
+            else {'instances': [], 'error': ((mssql_test_registry_raw.stderr | default('') | trim) or 'Registry discovery returned no output')[:300]}
+          }}
+        mssql_test_services: >-
+          {{
+            (mssql_test_services_raw.stdout | from_json).services
+            if ((mssql_test_services_raw.stdout | default('') | trim) is match('^\{'))
+            else []
+          }}
+        mssql_test_disks: >-
+          {{
+            (mssql_test_disks_raw.stdout | from_json).disks
+            if ((mssql_test_disks_raw.stdout | default('') | trim) is match('^\{'))
+            else []
+          }}
+      when: mssql_test_winrm_ok | bool
+
+    - name: Query SERVERPROPERTY with integrated authentication
+      ansible.windows.win_shell: |
+        $sqlcmd = '{{ mssql_test_sqlcmd_path_ps }}'
+        if (-not $sqlcmd) {
+          @{ sql_query_ok = $false; sql_error = 'sqlcmd not available' } | ConvertTo-Json -Compress
+          exit 0
+        }
+        $query = "SET NOCOUNT ON; SELECT " +
+          "CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), " +
+          "CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)), " +
+          "CAST(SERVERPROPERTY('ProductUpdateLevel') AS nvarchar(128)), " +
+          "CAST(SERVERPROPERTY('ProductUpdateReference') AS nvarchar(128)), " +
+          "CAST(SERVERPROPERTY('ProductMajorVersion') AS nvarchar(128)), " +
+          "CAST(SERVERPROPERTY('IsClustered') AS nvarchar(16)), " +
+          "CAST(SERVERPROPERTY('IsHadrEnabled') AS nvarchar(16));"
+        $out = & $sqlcmd -S '{{ mssql_test_server_ps }}' -E -b -l 15 -h -1 -W -s '|' -Q $query 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          $msg = ($out | Out-String).Trim()
+          if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) }
+          @{ sql_query_ok = $false; sql_error = $msg } | ConvertTo-Json -Compress
+          exit 0
+        }
+        $line = $out | Where-Object { ([string]$_).Trim() -ne '' } | Select-Object -First 1
+        if (-not $line) {
+          @{ sql_query_ok = $false; sql_error = 'Empty SERVERPROPERTY result' } | ConvertTo-Json -Compress
+          exit 0
+        }
+        $p = @(([string]$line).Split('|') | ForEach-Object { $_.Trim() })
+        while ($p.Count -lt 7) { $p += '' }
+        [ordered]@{
+          sql_query_ok             = $true
+          product_version          = $p[0]
+          product_level            = $p[1]
+          product_update_level     = $p[2]
+          product_update_reference = $p[3]
+          product_major_version    = $p[4]
+          is_clustered             = $p[5]
+          is_hadr_enabled          = $p[6]
+        } | ConvertTo-Json -Compress
+      loop: "{{ mssql_test_registry.instances | default([]) if (mssql_test_winrm_ok | bool) else [] }}"
+      loop_control:
+        label: "{{ item.instance_name }}"
+      vars:
+        mssql_test_sqlcmd_path_ps: "{{ mssql_test_sqlcmd_info.path | default('') | replace(\"'\", \"''\") }}"
+        mssql_test_server_ps: "{{ item.server_name | replace(\"'\", \"''\") }}"
+      register: mssql_test_sql_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Merge instance and SQL query results
+      ansible.builtin.set_fact:
+        mssql_test_instances: >-
+          {{
+            mssql_test_instances
+            + [
+              item.item | combine(
+                (item.stdout | from_json)
+                if ((item.stdout | default('') | trim) is match('^\{'))
+                else {
+                  'sql_query_ok': false,
+                  'sql_error': ((item.stderr | default('') | trim) or 'SQL query returned no output')[:300]
+                }
+              )
+            ]
+          }}
+      loop: "{{ mssql_test_sql_raw.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.instance_name | default('') }}"
+
+    - name: Build mssql_test_result
+      ansible.builtin.set_fact:
+        mssql_test_result:
+          hostname: "{{ inventory_hostname }}"
+          winrm_ok: "{{ mssql_test_winrm_ok | bool }}"
+          winrm_error: "{{ mssql_test_winrm_error }}"
+          sqlcmd_configured: "{{ mssql_test_sqlcmd }}"
+          sqlcmd_available: "{{ mssql_test_sqlcmd_info.available | default(false) | bool }}"
+          sqlcmd_path: "{{ mssql_test_sqlcmd_info.path | default('') }}"
+          instance_discovery_error: "{{ mssql_test_registry.error | default('') or '' }}"
+          instances: "{{ mssql_test_instances }}"
+          sql_services: "{{ mssql_test_services | default([]) }}"
+          disks: "{{ mssql_test_disks | default([]) }}"
+
+    - name: Show MSSQL diagnostic result
+      ansible.builtin.debug:
+        var: mssql_test_result

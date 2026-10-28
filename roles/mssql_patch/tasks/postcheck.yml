@@ -165,6 +165,12 @@
         | map(attribute='version.product_version')
         | list
       }}
+    mssql_post_instance_results: >-
+      {%- set out = [] -%}
+      {%- for i in mssql_instances_targeted | default([]) -%}
+      {%- set _ = out.append({'instance_name': i.instance_name, 'build': i.version.product_version | default('')}) -%}
+      {%- endfor -%}
+      {{ out }}
   changed_when: false
   tags:
     - postcheck

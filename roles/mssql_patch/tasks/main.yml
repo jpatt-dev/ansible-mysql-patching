@@ -1,9 +1,12 @@
 ---
-# validate → discover → precheck → (optional remediation) → postcheck → report
+# validate → discover → precheck → (optional remediation) → postcheck → per-host report
 
 - name: Capture job start timestamp
   ansible.builtin.set_fact:
     mssql_job_started_at: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+    mssql_lifecycle_failed: false
+    mssql_lifecycle_failed_phase: ""
+    mssql_failure_reason_code: ""
   changed_when: false
 
 - name: Validate inputs and load patch definition
@@ -12,6 +15,11 @@
 - name: Discover SQL instances
   ansible.builtin.include_tasks: discover.yml
 
+- name: Record initial connectivity for reporting
+  ansible.builtin.set_fact:
+    mssql_initial_connectivity_ok: "{{ mssql_connectivity_ok | default(false) | bool }}"
+  changed_when: false
+
 - name: Precheck and set remediation eligibility
   ansible.builtin.include_tasks: precheck.yml
 
@@ -19,33 +27,96 @@
   when:
     - mssql_execute_patch | default(false) | bool
     - mssql_remediation_eligible | default(false) | bool
+    - not (patching_exception_active | default(false) | bool)
+    - mssql_remediation_required | default(true) | bool
+  ignore_unreachable: true
   block:
-    - name: Optional pre-patch reboot
-      ansible.builtin.include_tasks: reboot.yml
-      vars:
-        mssql_reboot_phase: pre
+    - name: Pre-reboot phase
+      when: not (mssql_lifecycle_failed | bool)
+      block:
+        - name: Mark pre-reboot phase
+          ansible.builtin.set_fact:
+            mssql_lifecycle_phase: pre_reboot
 
-    - name: Stage installer
-      ansible.builtin.include_tasks: stage.yml
+        - name: Optional pre-patch reboot
+          ansible.builtin.include_tasks: reboot.yml
+          vars:
+            mssql_reboot_phase: pre
 
-    - name: Apply SQL patch
-      ansible.builtin.include_tasks: apply.yml
+        - name: Connectivity checkpoint after pre-reboot
+          ansible.builtin.include_tasks: connectivity_checkpoint.yml
 
-    - name: Optional post-patch reboot
-      ansible.builtin.include_tasks: reboot.yml
-      vars:
-        mssql_reboot_phase: post
+    - name: Stage phase
+      when: not (mssql_lifecycle_failed | bool)
+      block:
+        - name: Mark stage phase
+          ansible.builtin.set_fact:
+            mssql_lifecycle_phase: stage
+
+        - name: Stage installer
+          ansible.builtin.include_tasks: stage.yml
+
+        - name: Connectivity checkpoint after stage
+          ansible.builtin.include_tasks: connectivity_checkpoint.yml
+
+    - name: Apply phase
+      when: not (mssql_lifecycle_failed | bool)
+      block:
+        - name: Mark apply phase
+          ansible.builtin.set_fact:
+            mssql_lifecycle_phase: apply
+
+        - name: Apply SQL patch
+          ansible.builtin.include_tasks: apply.yml
+
+        - name: Connectivity checkpoint after apply
+          ansible.builtin.include_tasks: connectivity_checkpoint.yml
+
+    - name: Post-reboot phase
+      when: not (mssql_lifecycle_failed | bool)
+      block:
+        - name: Mark post-reboot phase
+          ansible.builtin.set_fact:
+            mssql_lifecycle_phase: post_reboot
+
+        - name: Optional post-patch reboot
+          ansible.builtin.include_tasks: reboot.yml
+          vars:
+            mssql_reboot_phase: post
+
+        - name: Connectivity checkpoint after post-reboot
+          ansible.builtin.include_tasks: connectivity_checkpoint.yml
   rescue:
     - name: Record remediation operational failure
       ansible.builtin.set_fact:
         patch_status: failed
+        mssql_lifecycle_failed: true
+        mssql_lifecycle_failed_phase: "{{ mssql_lifecycle_phase | default('unknown') }}"
         mssql_failure_reason: "{{ ansible_failed_result.msg | default(ansible_failed_result | string) }}"
         mssql_apply_readiness_reason: "{{ ansible_failed_result.msg | default('remediation failed') }}"
       changed_when: false
+
+    - name: Classify remediation failure connectivity
+      ansible.builtin.include_tasks: connectivity_checkpoint.yml
+
+- name: Record already-compliant outcome without remediation
+  ansible.builtin.set_fact:
+    patch_status: already_compliant
+    patch_attempted: false
+    mssql_installer_result_normalized: already_compliant
+    pre_reboot_performed: false
+    post_reboot_performed: false
+    reboot_performed: false
+  when:
+    - mssql_execute_patch | default(false) | bool
+    - mssql_remediation_eligible | default(false) | bool
+    - not (patching_exception_active | default(false) | bool)
+    - not (mssql_remediation_required | default(true) | bool)
+  changed_when: false
 
 - name: Postcheck
   ansible.builtin.include_tasks: postcheck.yml
   when: mssql_connectivity_ok | default(false) | bool
 
-- name: Publish evidence and final result
+- name: Build per-host result and evidence
   ansible.builtin.include_tasks: report.yml

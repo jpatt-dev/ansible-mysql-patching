@@ -390,6 +390,32 @@
         | map(attribute='version.product_version')
         | list
       }}
+    mssql_pre_instance_results: >-
+      {%- set out = [] -%}
+      {%- for i in mssql_instances_targeted | default([]) -%}
+      {%- set _ = out.append({'instance_name': i.instance_name, 'build': i.version.product_version | default('')}) -%}
+      {%- endfor -%}
+      {{ out }}
+  changed_when: false
+  tags:
+    - precheck
+
+- name: Derive mssql_remediation_required
+  ansible.builtin.set_fact:
+    mssql_remediation_required: >-
+      {{
+        not (
+          ((mssql_instances_targeted | default([]) | length) > 0)
+          and (
+            (
+              mssql_instances_targeted | default([])
+              | selectattr('probe_ok', 'equalto', true)
+              | selectattr('applicability.status', 'equalto', 'already_compliant')
+              | list | length
+            ) == (mssql_instances_targeted | default([]) | length)
+          )
+        )
+      }}
   changed_when: false
   tags:
     - precheck
@@ -414,6 +440,7 @@
       precheck host={{ inventory_hostname }}
       status={{ precheck_status }}
       eligible={{ mssql_remediation_eligible }}
+      remediation_required={{ mssql_remediation_required }}
       execute_patch={{ mssql_execute_patch | default(false) }}
       not_applicable={{ mssql_instances_not_applicable | default([]) | length }}
   changed_when: false

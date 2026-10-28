@@ -1,0 +1,27 @@
+---
+# Re-verify WinRM after a remediation phase. On loss, record UNREACHABLE so later mutating phases are skipped.
+
+- name: Verify connectivity after remediation phase
+  block:
+    - name: Wait for WinRM after {{ mssql_lifecycle_phase | default('remediation') }}
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ mssql_connectivity_recheck_timeout | default(120) | int }}"
+        sleep: 5
+      ignore_unreachable: true
+      register: mssql_checkpoint_result
+
+    - name: Treat unreachable checkpoint as connectivity loss
+      ansible.builtin.fail:
+        msg: WinRM unreachable at connectivity checkpoint
+      when: mssql_checkpoint_result is unreachable
+  rescue:
+    - name: Record connectivity loss and stop remaining remediation
+      ansible.builtin.set_fact:
+        mssql_lifecycle_failed: true
+        mssql_lifecycle_failed_phase: "{{ mssql_lifecycle_phase | default('unknown') }}"
+        mssql_failure_reason_code: UNREACHABLE
+        mssql_failure_reason: >-
+          WinRM connectivity lost during {{ mssql_lifecycle_phase | default('remediation') }}
+          and not recovered within {{ mssql_connectivity_recheck_timeout | default(120) }}s.
+        mssql_connectivity_ok: false
+      changed_when: false

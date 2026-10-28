@@ -6,3 +6,27 @@
     mssql_execute_patch: false
   roles:
     - role: mssql_patch
+
+- name: MSSQL precheck - aggregate reporting
+  hosts: mssql_hosts
+  gather_facts: false
+  connection: local
+  vars:
+    mssql_execute_patch: false
+  tasks:
+    - name: Aggregate MSSQL results
+      ansible.builtin.include_role:
+        name: mssql_patch
+        tasks_from: report_aggregate.yml
+
+    - name: Write MSSQL report files
+      ansible.builtin.include_role:
+        name: mssql_patch
+        tasks_from: report_write.yml
+
+    - name: Fail closed when precheck is blocked or failed
+      ansible.builtin.fail:
+        msg: >-
+          MSSQL precheck {{ hostvars[inventory_hostname].precheck_status }} on {{ inventory_hostname }}:
+          {{ hostvars[inventory_hostname].mssql_host_result.reason | default('') }}
+      when: (hostvars[inventory_hostname].precheck_status | default('')) in ['blocked', 'failed']

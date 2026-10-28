@@ -70,6 +70,7 @@
     mssql_reboot_should_run: >-
       {{
         (mssql_reboot_mode_effective != 'never')
+        and ((patch_status | default('')) != 'already_compliant')
         and (
           (mssql_reboot_mode_effective == 'always')
           or (pending_reboot | default(false) | bool)
@@ -123,6 +124,7 @@
           and (mssql_reboot_result is defined)
           and not (mssql_reboot_result is skipped)
           and not (mssql_reboot_result is failed)
+          and not (mssql_reboot_result is unreachable)
         )
         or (pre_reboot_performed | default(false) | bool)
       }}
@@ -134,6 +136,7 @@
           and (mssql_reboot_result is defined)
           and not (mssql_reboot_result is skipped)
           and not (mssql_reboot_result is failed)
+          and not (mssql_reboot_result is unreachable)
         )
         or (post_reboot_performed | default(false) | bool)
       }}
@@ -146,6 +149,7 @@
             and (mssql_reboot_result is defined)
             and not (mssql_reboot_result is skipped)
             and not (mssql_reboot_result is failed)
+            and not (mssql_reboot_result is unreachable)
           )
           or (pre_reboot_performed | default(false) | bool)
         )
@@ -156,6 +160,7 @@
             and (mssql_reboot_result is defined)
             and not (mssql_reboot_result is skipped)
             and not (mssql_reboot_result is failed)
+            and not (mssql_reboot_result is unreachable)
           )
           or (post_reboot_performed | default(false) | bool)
         )

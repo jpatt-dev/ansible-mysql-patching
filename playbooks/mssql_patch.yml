@@ -1,8 +1,26 @@
 ---
-- name: MSSQL patch
+- name: MSSQL patch - serial host lifecycle
   hosts: mssql_hosts
   gather_facts: false
+  serial: "{{ patch_serial | default(1) }}"
   vars:
     mssql_execute_patch: true
   roles:
     - role: mssql_patch
+
+- name: MSSQL patch - aggregate reporting
+  hosts: mssql_hosts
+  gather_facts: false
+  connection: local
+  vars:
+    mssql_execute_patch: true
+  tasks:
+    - name: Aggregate MSSQL results
+      ansible.builtin.include_role:
+        name: mssql_patch
+        tasks_from: report_aggregate.yml
+
+    - name: Write MSSQL report files
+      ansible.builtin.include_role:
+        name: mssql_patch
+        tasks_from: report_write.yml

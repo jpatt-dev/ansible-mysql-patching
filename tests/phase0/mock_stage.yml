@@ -1,0 +1,6 @@
+---
+- name: Mock stage records that staging ran
+  ansible.builtin.set_fact:
+    phases_ran: "{{ phases_ran + ['stage'] }}"
+    stage_status: staged
+  changed_when: false

@@ -1,0 +1,248 @@
+---
+# Phase 0 safety regression: already-compliant, no-applicable, RC 3010.
+# Mocks stage/apply/reboot — never installs or reboots.
+
+- name: Phase 0 MSSQL safety regressions
+  hosts: mssql_hosts
+  gather_facts: false
+  vars:
+    mssql_execute_patch: true
+    mssql_definition_success_rcs: [0]
+    mssql_definition_reboot_rcs: [3010]
+    mssql_pre_patch_reboot_mode: if_required
+    mssql_post_patch_reboot_mode: if_required
+    scenarios:
+      h_already_compliant:
+        mssql_remediation_required: false
+        mssql_remediation_eligible: true
+        pending_reboot: false
+        mssql_instances_needing_patch: []
+        mssql_instances_already_compliant:
+          - {instance_name: MSSQLSERVER, applicability: {status: already_compliant}}
+      h_already_compliant_pending_reboot:
+        mssql_remediation_required: false
+        mssql_remediation_eligible: true
+        pending_reboot: true
+        pending_reboot_reasons: [WU_RebootRequired]
+        mssql_instances_needing_patch: []
+        mssql_instances_already_compliant:
+          - {instance_name: MSSQLSERVER, applicability: {status: already_compliant}}
+      h_no_applicable:
+        mssql_remediation_required: false
+        mssql_remediation_eligible: true
+        pending_reboot: false
+        mssql_instances_needing_patch: []
+        mssql_instances_already_compliant:
+          - {instance_name: MSSQLSERVER, applicability: {status: already_compliant}}
+      h_rc3010_json:
+        mssql_remediation_required: true
+        mssql_remediation_eligible: true
+        pending_reboot: false
+        mssql_instances_needing_patch:
+          - {instance_name: MSSQLSERVER, applicability: {status: applicable}}
+        mssql_instances_already_compliant: []
+        wrapper_ansible_rc: 0
+        wrapper_stdout: >-
+          {"ok":true,"exit_code":3010,"setup_log_paths":[],"evidence_paths":[]}
+      h_rc3010_legacy_exit:
+        mssql_remediation_required: true
+        mssql_remediation_eligible: true
+        pending_reboot: false
+        mssql_instances_needing_patch:
+          - {instance_name: MSSQLSERVER, applicability: {status: applicable}}
+        mssql_instances_already_compliant: []
+        wrapper_ansible_rc: 3010
+        wrapper_stdout: >-
+          {"ok":true,"exit_code":3010,"setup_log_paths":[],"evidence_paths":[]}
+      h_rc3010_no_json:
+        mssql_remediation_required: true
+        mssql_remediation_eligible: true
+        pending_reboot: false
+        mssql_instances_needing_patch:
+          - {instance_name: MSSQLSERVER, applicability: {status: applicable}}
+        mssql_instances_already_compliant: []
+        wrapper_ansible_rc: 3010
+        wrapper_stdout: ""
+  tasks:
+    - name: Initialize host state after validate/discover/precheck
+      ansible.builtin.set_fact:
+        phases_ran: []
+        mock_reboot_attempted: false
+        patching_exception_active: false
+        mssql_lifecycle_failed: false
+        mssql_lifecycle_failed_phase: ""
+        mssql_connectivity_ok: true
+        mssql_initial_connectivity_ok: true
+        precheck_status: passed
+        patch_status: not_attempted
+        patch_attempted: false
+        stage_status: pending
+        pre_reboot_performed: false
+        post_reboot_performed: false
+        reboot_performed: false
+        reboot_required: false
+        mssql_installer_result_normalized: not_available
+
+    - name: Apply scenario facts
+      ansible.builtin.set_fact:
+        "{{ item.key }}": "{{ item.value }}"
+      loop: "{{ scenarios[inventory_hostname] | dict2items }}"
+
+    - name: Remediation lifecycle (mirrors roles/mssql_patch/tasks/main.yml gates)
+      when:
+        - mssql_execute_patch | default(false) | bool
+        - mssql_remediation_eligible | default(false) | bool
+        - not (patching_exception_active | default(false) | bool)
+        - mssql_remediation_required | default(true) | bool
+      block:
+        - name: Pre-reboot phase
+          when: not (mssql_lifecycle_failed | bool)
+          block:
+            - name: Mark pre-reboot phase
+              ansible.builtin.set_fact:
+                mssql_lifecycle_phase: pre_reboot
+
+            - name: Optional pre-patch reboot
+              ansible.builtin.include_tasks: mock_reboot.yml
+              vars:
+                mssql_reboot_phase: pre
+
+        - name: Stage phase
+          when: not (mssql_lifecycle_failed | bool)
+          block:
+            - name: Mark stage phase
+              ansible.builtin.set_fact:
+                mssql_lifecycle_phase: stage
+
+            - name: Stage installer
+              ansible.builtin.include_tasks: mock_stage.yml
+
+        - name: Apply phase
+          when: not (mssql_lifecycle_failed | bool)
+          block:
+            - name: Mark apply phase
+              ansible.builtin.set_fact:
+                mssql_lifecycle_phase: apply
+
+            - name: Apply SQL patch
+              ansible.builtin.include_tasks: mock_apply.yml
+
+        - name: Post-reboot phase
+          when: not (mssql_lifecycle_failed | bool)
+          block:
+            - name: Mark post-reboot phase
+              ansible.builtin.set_fact:
+                mssql_lifecycle_phase: post_reboot
+
+            - name: Optional post-patch reboot
+              ansible.builtin.include_tasks: mock_reboot.yml
+              vars:
+                mssql_reboot_phase: post
+
+    - name: Record already-compliant outcome without remediation
+      ansible.builtin.set_fact:
+        patch_status: already_compliant
+        patch_attempted: false
+        mssql_installer_result_normalized: already_compliant
+        pre_reboot_performed: false
+        post_reboot_performed: false
+        reboot_performed: false
+      when:
+        - mssql_execute_patch | default(false) | bool
+        - mssql_remediation_eligible | default(false) | bool
+        - not (patching_exception_active | default(false) | bool)
+        - not (mssql_remediation_required | default(true) | bool)
+      changed_when: false
+
+    - name: Derive report-like outcome fields
+      ansible.builtin.set_fact:
+        report_result: "{{ patch_status }}"
+        report_reboot_required: "{{ reboot_required | default(false) | bool }}"
+      changed_when: false
+
+    - name: Show host outcome
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          phases={{ phases_ran | join(',') }}
+          patch_status={{ patch_status }}
+          normalized={{ mssql_installer_result_normalized | default('n/a') }}
+          attempted={{ patch_attempted | default(false) }}
+          pre_reboot={{ pre_reboot_performed | default(false) }}
+          post_reboot={{ post_reboot_performed | default(false) }}
+          mock_reboot_attempted={{ mock_reboot_attempted | default(false) }}
+          rc={{ mssql_installer_return_code | default('n/a') }}
+
+    - name: Assert already-compliant (no pending reboot)
+      ansible.builtin.assert:
+        that:
+          - phases_ran | length == 0
+          - patch_status == 'already_compliant'
+          - not (patch_attempted | bool)
+          - not (pre_reboot_performed | bool)
+          - not (post_reboot_performed | bool)
+          - not (reboot_performed | bool)
+          - not (mock_reboot_attempted | bool)
+        quiet: true
+      when: inventory_hostname == 'h_already_compliant'
+
+    - name: Assert already-compliant with OS pending reboot still skips remediation
+      ansible.builtin.assert:
+        that:
+          - phases_ran | length == 0
+          - patch_status == 'already_compliant'
+          - not (patch_attempted | bool)
+          - not (pre_reboot_performed | bool)
+          - not (post_reboot_performed | bool)
+          - not (reboot_performed | bool)
+          - not (mock_reboot_attempted | bool)
+          - pending_reboot | bool
+        quiet: true
+      when: inventory_hostname == 'h_already_compliant_pending_reboot'
+
+    - name: Assert no applicable update skips stage apply reboot
+      ansible.builtin.assert:
+        that:
+          - phases_ran | length == 0
+          - patch_status == 'already_compliant'
+          - not (patch_attempted | bool)
+          - not (mock_reboot_attempted | bool)
+          - "'stage' not in phases_ran"
+          - "'apply' not in phases_ran"
+        quiet: true
+      when: inventory_hostname == 'h_no_applicable'
+
+    - name: Assert RC 3010 with JSON and process exit 0 is reboot_required
+      ansible.builtin.assert:
+        that:
+          - "'apply' in phases_ran"
+          - patch_status == 'reboot_required'
+          - mssql_installer_result_normalized == 'reboot_required'
+          - mssql_installer_return_code | int == 3010
+          - patch_attempted | bool
+          - reboot_required | bool
+          - post_reboot_performed | bool
+        quiet: true
+      when: inventory_hostname == 'h_rc3010_json'
+
+    - name: Assert RC 3010 legacy process exit still classifies via JSON
+      ansible.builtin.assert:
+        that:
+          - patch_status == 'reboot_required'
+          - mssql_installer_result_normalized == 'reboot_required'
+          - mssql_installer_return_code | int == 3010
+          - patch_attempted | bool
+          - not (patch_status == 'failed')
+        quiet: true
+      when: inventory_hostname == 'h_rc3010_legacy_exit'
+
+    - name: Assert RC 3010 without JSON remains fail-closed
+      ansible.builtin.assert:
+        that:
+          - patch_status == 'failed'
+          - mssql_installer_result_normalized == 'failed'
+          - mssql_installer_return_code | int == 3010
+          - patch_attempted | bool
+          - "'cannot be verified' in (mssql_failure_reason | default(''))"
+        quiet: true
+      when: inventory_hostname == 'h_rc3010_no_json'

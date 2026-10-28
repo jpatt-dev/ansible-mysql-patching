@@ -1,0 +1,67 @@
+---
+# Mock reboot: records intent; never calls win_reboot.
+- name: Normalize reboot phase and policy (mock)
+  ansible.builtin.set_fact:
+    mssql_reboot_phase: "{{ mssql_reboot_phase | default('post') | trim | lower }}"
+    mssql_reboot_mode_effective: >-
+      {{
+        (mssql_pre_patch_reboot_mode | default('if_required') | trim | lower)
+        if ((mssql_reboot_phase | default('post')) == 'pre')
+        else (mssql_post_patch_reboot_mode | default('if_required') | trim | lower)
+      }}
+
+- name: Derive apply reboot signal for post phase (mock)
+  ansible.builtin.set_fact:
+    mssql_apply_reboot_required: >-
+      {{
+        (reboot_required | default(false) | bool)
+        or (mssql_reboot_required | default(false) | bool)
+        or ((mssql_installer_result_normalized | default('')) == 'reboot_required')
+        or ((patch_status | default('')) == 'reboot_required')
+      }}
+  when: mssql_reboot_phase == 'post'
+  changed_when: false
+
+- name: Use injected pending_reboot for mock (no WinRM)
+  ansible.builtin.set_fact:
+    pending_reboot: "{{ pending_reboot | default(false) | bool }}"
+    pending_reboot_reasons: "{{ pending_reboot_reasons | default([]) }}"
+  changed_when: false
+
+- name: Derive whether this reboot phase should run (production rule mirror)
+  ansible.builtin.set_fact:
+    mssql_reboot_should_run: >-
+      {{
+        (mssql_reboot_mode_effective != 'never')
+        and ((patch_status | default('')) != 'already_compliant')
+        and (
+          (mssql_reboot_mode_effective == 'always')
+          or (pending_reboot | default(false) | bool)
+          or (
+            (mssql_reboot_phase == 'post')
+            and (mssql_apply_reboot_required | default(false) | bool)
+          )
+        )
+      }}
+  changed_when: false
+
+- name: Record mock reboot intent without rebooting
+  ansible.builtin.set_fact:
+    phases_ran: "{{ phases_ran + [mssql_reboot_phase ~ '_reboot'] }}"
+    mock_reboot_attempted: "{{ (mock_reboot_attempted | default(false) | bool) or (mssql_reboot_should_run | bool) }}"
+    pre_reboot_performed: >-
+      {{
+        ((mssql_reboot_phase == 'pre') and (mssql_reboot_should_run | bool))
+        or (pre_reboot_performed | default(false) | bool)
+      }}
+    post_reboot_performed: >-
+      {{
+        ((mssql_reboot_phase == 'post') and (mssql_reboot_should_run | bool))
+        or (post_reboot_performed | default(false) | bool)
+      }}
+    reboot_performed: >-
+      {{
+        (mssql_reboot_should_run | bool)
+        or (reboot_performed | default(false) | bool)
+      }}
+  changed_when: false

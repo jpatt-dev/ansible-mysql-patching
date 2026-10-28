@@ -1,0 +1,140 @@
+---
+# Population-wide aggregation. Include only from a non-serial reporting play.
+
+- name: Resolve reporting population
+  ansible.builtin.set_fact:
+    mssql_report_hosts: "{{ ansible_play_hosts_all | sort }}"
+    mssql_report_timestamp: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+  run_once: true
+  changed_when: false
+
+- name: Build host-keyed mssql_patch_results from hostvars
+  ansible.builtin.set_fact:
+    mssql_patch_results: >-
+      {%- set out = {} -%}
+      {%- for h in mssql_report_hosts -%}
+      {%- set hv = hostvars[h] -%}
+      {%- if hv.mssql_host_result is defined -%}
+      {%- set _ = out.update({h: hv.mssql_host_result}) -%}
+      {%- else -%}
+      {%- set exempt = hv.patching_exception_enabled | default(false) | bool -%}
+      {%- set _ = out.update({h: {
+            'schema_version': mssql_report_schema_version | default(1) | int,
+            'technology': 'mssql',
+            'run_mode': 'patch' if (mssql_execute_patch | default(false) | bool) else 'precheck',
+            'host': h,
+            'hostname': h,
+            'fqdn': '',
+            'os_release': '',
+            'os_build': '',
+            'location': hv.patch_location | default('') | string,
+            'patch_window': hv.patch_window | default('') | string,
+            'patch_wave': hv.patch_wave | default('') | string,
+            'change_ticket_id': hv.change_ticket_id | default(''),
+            'aap_job_id': tower_job_id | default(awx_job_id | default('')) | string,
+            'run_id': hv.mssql_run_id | default(''),
+            'exempt': exempt,
+            'exemption_source': 'inventory' if exempt else 'none',
+            'exemption_reference': (hv.patching_exception_reference | default('')) if exempt else '',
+            'patched': false,
+            'patch_attempted': hv.patch_attempted | default(false) | bool,
+            'result': 'unknown',
+            'final_status': 'unknown',
+            'reason': 'No per-host result recorded; host failed or became unreachable before reporting',
+            'reason_code': 'UNKNOWN_RESULT',
+            'discovery_status': hv.mssql_discovery_status | default('n/a'),
+            'precheck_status': hv.precheck_status | default('n/a'),
+            'stage_status': hv.stage_status | default('n/a'),
+            'patch_status': hv.patch_status | default('not_attempted'),
+            'postcheck_status': hv.postcheck_status | default('n/a'),
+            'reboot_required': hv.reboot_required | default(false) | bool,
+            'pending_reboot': hv.pending_reboot | default(false) | bool,
+            'pre_reboot_performed': hv.pre_reboot_performed | default(false) | bool,
+            'post_reboot_performed': hv.post_reboot_performed | default(false) | bool,
+            'kb_id': hv.kb_id | default(''),
+            'sql_product_major_version': hv.mssql_definition_sql_product_major_version | default(''),
+            'servicing_branch': hv.mssql_definition_servicing_branch | default(''),
+            'target_build': hv.mssql_definition_target_build | default(''),
+            'installer_filename': hv.mssql_definition_installer_filename | default(''),
+            'installer_sha256': hv.mssql_definition_checksum_value | default(''),
+            'instances_targeted': [],
+            'pre_builds': hv.mssql_pre_builds | default([]),
+            'post_builds': [],
+            'pre_instance_results': hv.mssql_pre_instance_results | default([]),
+            'post_instance_results': [],
+            'installer_return_code': hv.mssql_installer_return_code | default('not_available'),
+            'installer_result_normalized': hv.mssql_installer_result_normalized | default('not_available'),
+            'failure_reason': hv.mssql_failure_reason | default(''),
+            'setup_log_paths': hv.mssql_setup_log_paths | default([]),
+            'evidence_paths': [],
+            'started_at': hv.mssql_job_started_at | default(''),
+            'ended_at': ''
+          }}) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+  run_once: true
+  changed_when: false
+
+- name: Calculate aggregate summary
+  ansible.builtin.set_fact:
+    mssql_patch_summary: >-
+      {%- set results = mssql_patch_results | dict2items | map(attribute='value') | list -%}
+      {%- set patched = results | selectattr('patched', 'equalto', true) | list -%}
+      {%- set not_patched = results | rejectattr('patched', 'equalto', true) | list -%}
+      {%- set canonical = ['success', 'already_compliant', 'exempt', 'blocked', 'failed', 'degraded', 'unknown'] -%}
+      {%- set result_counts = {} -%}
+      {%- set not_patched_counts = {} -%}
+      {%- for c in canonical -%}
+      {%- set _ = result_counts.update({c: results | selectattr('result', 'equalto', c) | list | length}) -%}
+      {%- set _ = not_patched_counts.update({c: not_patched | selectattr('result', 'equalto', c) | list | length}) -%}
+      {%- endfor -%}
+      {%- set job_id = tower_job_id | default(awx_job_id | default('')) | string -%}
+      {%- set run_ids = results | map(attribute='run_id') | select | list -%}
+      {{
+        {
+          'schema_version': mssql_report_schema_version | default(1) | int,
+          'technology': 'mssql',
+          'run_mode': (results | map(attribute='run_mode') | first | default('patch')),
+          'run_id': job_id if job_id else (run_ids | first | default('')),
+          'aap_job_id': job_id,
+          'run_timestamp': mssql_report_timestamp,
+          'kb_id': results | map(attribute='kb_id') | select | first | default(''),
+          'target_build': results | map(attribute='target_build') | select | first | default(''),
+          'change_ticket_id': results | map(attribute='change_ticket_id') | select | first | default(''),
+          'total_systems': results | length,
+          'systems_patched': patched | length,
+          'systems_not_patched': not_patched | length,
+          'not_patched': not_patched_counts,
+          'result_counts': result_counts,
+          'hosts_missing_result': mssql_report_hosts | map('extract', hostvars) | selectattr('mssql_host_result', 'undefined') | list | length
+        }
+      }}
+  run_once: true
+  changed_when: false
+
+- name: Assert aggregate counts are consistent
+  ansible.builtin.assert:
+    that:
+      - (mssql_patch_summary.systems_patched + mssql_patch_summary.systems_not_patched) == mssql_patch_summary.total_systems
+      - mssql_patch_summary.total_systems == (mssql_report_hosts | length)
+    fail_msg: MSSQL aggregate counts are inconsistent with the reporting population.
+    quiet: true
+  run_once: true
+
+- name: Publish MSSQL results for AAP
+  ansible.builtin.set_stats:
+    data:
+      mssql_patch_summary: "{{ mssql_patch_summary }}"
+      mssql_patch_results: "{{ mssql_patch_results }}"
+    per_host: false
+  run_once: true
+
+- name: Aggregate summary
+  ansible.builtin.debug:
+    msg: >-
+      total={{ mssql_patch_summary.total_systems }}
+      patched={{ mssql_patch_summary.systems_patched }}
+      not_patched={{ mssql_patch_summary.systems_not_patched }}
+      results={{ mssql_patch_summary.result_counts | to_json }}
+  run_once: true

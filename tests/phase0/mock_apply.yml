@@ -1,0 +1,125 @@
+---
+# Simulate apply.yml wrapper JSON / RC handling without installing.
+- name: Record apply phase entry
+  ansible.builtin.set_fact:
+    phases_ran: "{{ phases_ran + ['apply'] }}"
+  changed_when: false
+
+- name: Skip apply when already compliant (production short-circuit)
+  ansible.builtin.set_fact:
+    patch_attempted: false
+    patch_status: already_compliant
+    mssql_installer_result_normalized: already_compliant
+  when:
+    - (mssql_instances_needing_patch | default([]) | length) == 0
+    - (mssql_instances_already_compliant | default([]) | length) > 0
+  changed_when: false
+
+- name: Build simulated wrapper exec result
+  ansible.builtin.set_fact:
+    mssql_wrapper_exec:
+      rc: "{{ wrapper_ansible_rc | default(0) | int }}"
+      # Keep stdout as a string. Ansible may auto-convert JSON-looking set_fact
+      # values into dicts; re-encode mappings so parsing matches win_shell stdout.
+      stdout: >-
+        {{
+          (wrapper_stdout | to_json)
+          if (wrapper_stdout is mapping)
+          else (wrapper_stdout | default('') | string)
+        }}
+  when:
+    - (patch_status | default('')) != 'already_compliant'
+    - (mssql_instances_needing_patch | default([]) | length) > 0
+  changed_when: false
+
+- name: Normalize wrapper stdout for JSON parsing
+  ansible.builtin.set_fact:
+    mssql_wrapper_json_text: >-
+      {{
+        (mssql_wrapper_exec.stdout | to_json)
+        if (mssql_wrapper_exec.stdout is mapping)
+        else (mssql_wrapper_exec.stdout | default('') | trim | string)
+      }}
+  when: mssql_wrapper_exec is defined
+  changed_when: false
+
+- name: Detect wrapper stdout that looks like JSON
+  ansible.builtin.set_fact:
+    mssql_wrapper_looks_like_json: "{{ mssql_wrapper_json_text | default('') is regex('^\\{') }}"
+  when: mssql_wrapper_exec is defined
+  changed_when: false
+
+- name: Parse wrapper JSON result
+  when:
+    - mssql_wrapper_exec is defined
+    - mssql_wrapper_looks_like_json | default(false) | bool
+  block:
+    - name: Load wrapper JSON
+      ansible.builtin.set_fact:
+        mssql_wrapper_result: "{{ mssql_wrapper_json_text | from_json }}"
+        mssql_wrapper_json_ok: true
+        patch_attempted: true
+        mssql_installer_return_code_raw: "{{ (mssql_wrapper_json_text | from_json).exit_code | default(1) }}"
+      changed_when: false
+  rescue:
+    - name: Record malformed wrapper JSON as patch failure
+      ansible.builtin.set_fact:
+        mssql_wrapper_json_ok: false
+        patch_attempted: true
+        patch_status: failed
+        mssql_installer_result_normalized: failed
+        mssql_installer_return_code: "{{ mssql_wrapper_exec.rc | default(1) }}"
+        mssql_failure_reason: Wrapper stdout looked like JSON but from_json parse failed.
+      changed_when: false
+
+- name: Fail closed when wrapper output is not JSON-shaped
+  ansible.builtin.set_fact:
+    mssql_wrapper_json_ok: false
+    patch_attempted: true
+    patch_status: failed
+    mssql_installer_result_normalized: failed
+    mssql_installer_return_code: "{{ mssql_wrapper_exec.rc | default(1) }}"
+    mssql_failure_reason: >-
+      Wrapper returned empty or non-JSON stdout; installation outcome cannot be verified
+      (ansible_rc={{ mssql_wrapper_exec.rc | default('n/a') }}).
+  when:
+    - mssql_wrapper_exec is defined
+    - not (mssql_wrapper_looks_like_json | default(false) | bool)
+  changed_when: false
+
+- name: Normalize installer return code
+  ansible.builtin.set_fact:
+    mssql_installer_return_code: "{{ mssql_installer_return_code_raw | int }}"
+    mssql_installer_result_normalized: >-
+      {{
+        'success'
+        if ((mssql_installer_return_code_raw | int) in (mssql_definition_success_rcs | default([0]) | map('int') | list))
+        else (
+          'reboot_required'
+          if ((mssql_installer_return_code_raw | int) in (mssql_definition_reboot_rcs | default([3010]) | map('int') | list))
+          else 'failed'
+        )
+      }}
+  when:
+    - patch_attempted | default(false) | bool
+    - mssql_wrapper_json_ok | default(false) | bool
+  changed_when: false
+
+- name: Set reboot_required and patch_status from normalized result
+  ansible.builtin.set_fact:
+    mssql_reboot_required: "{{ mssql_installer_result_normalized == 'reboot_required' }}"
+    reboot_required: "{{ mssql_installer_result_normalized == 'reboot_required' }}"
+    patch_status: >-
+      {{
+        'success'
+        if (mssql_installer_result_normalized == 'success')
+        else (
+          'reboot_required'
+          if (mssql_installer_result_normalized == 'reboot_required')
+          else 'failed'
+        )
+      }}
+  when:
+    - patch_attempted | default(false) | bool
+    - mssql_wrapper_json_ok | default(false) | bool
+  changed_when: false

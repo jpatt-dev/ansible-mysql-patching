@@ -1,0 +1,116 @@
+---
+# Controller-side report files from mssql_patch_summary / mssql_patch_results. Include after report_aggregate.yml.
+
+- name: Set report file base path
+  ansible.builtin.set_fact:
+    mssql_report_base: >-
+      {{ mssql_report_dir }}/mssql-{{ mssql_patch_summary.run_mode }}-{{ mssql_patch_summary.run_id | default('run', true) | regex_replace('[^0-9A-Za-z_-]', '') }}
+    mssql_report_rows: "{{ mssql_patch_results | dict2items | map(attribute='value') | sort(attribute='host') | list }}"
+  run_once: true
+  changed_when: false
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Ensure controller report directory exists
+  ansible.builtin.file:
+    path: "{{ mssql_report_dir }}"
+    state: directory
+    mode: "0750"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Write authoritative JSON report
+  ansible.builtin.copy:
+    content: "{{ {'summary': mssql_patch_summary, 'results': mssql_patch_results} | to_nice_json }}\n"
+    dest: "{{ mssql_report_base }}.json"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Write business host CSV
+  ansible.builtin.copy:
+    content: |
+      {% macro q(v) %}"{{ v | string | replace('"', '""') }}"{% endmacro %}
+      Hostname,FQDN,OS Release,OS Build,Location,Patch Window,Patch Wave,KB,Target SQL Build,Post-Patch SQL Build,Patched,Exempt,Result,Reason,Change Ticket
+      {% for r in mssql_report_rows %}
+      {{ q(r.hostname) }},{{ q(r.fqdn) }},{{ q(r.os_release) }},{{ q(r.os_build) }},{{ q(r.location) }},{{ q(r.patch_window) }},{{ q(r.patch_wave) }},{{ q(r.kb_id) }},{{ q(r.target_build) }},{{ q(r.post_builds | default([]) | join('; ')) }},{{ q('Yes' if (r.patched | bool) else 'No') }},{{ q('Yes' if (r.exempt | bool) else 'No') }},{{ q(r.result) }},{{ q(r.reason) }},{{ q(r.change_ticket_id) }}
+      {% endfor %}
+    dest: "{{ mssql_report_base }}-hosts.csv"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Write analytics host dataset
+  ansible.builtin.copy:
+    content: |
+      {% macro q(v) %}"{{ v | string | replace('"', '""') }}"{% endmacro %}
+      {% macro b(v) %}{{ 'true' if (v | bool) else 'false' }}{% endmacro %}
+      schema_version,run_id,run_timestamp,technology,host,hostname,fqdn,location,patch_window,patch_wave,change_ticket_id,kb_id,target_build,exempt,exemption_source,patched,result,reason_code,precheck_status,postcheck_status,reboot_required,post_reboot_performed,aap_job_id
+      {% for r in mssql_report_rows %}
+      {{ r.schema_version | int }},{{ q(r.run_id) }},{{ q(mssql_patch_summary.run_timestamp) }},{{ q(r.technology) }},{{ q(r.host) }},{{ q(r.hostname) }},{{ q(r.fqdn) }},{{ q(r.location) }},{{ q(r.patch_window) }},{{ q(r.patch_wave) }},{{ q(r.change_ticket_id) }},{{ q(r.kb_id) }},{{ q(r.target_build) }},{{ b(r.exempt) }},{{ q(r.exemption_source) }},{{ b(r.patched) }},{{ q(r.result) }},{{ q(r.reason_code) }},{{ q(r.precheck_status) }},{{ q(r.postcheck_status) }},{{ b(r.reboot_required) }},{{ b(r.post_reboot_performed) }},{{ q(r.aap_job_id) }}
+      {% endfor %}
+    dest: "{{ mssql_report_base }}-analytics-hosts.csv"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Write analytics SQL instance dataset
+  ansible.builtin.copy:
+    content: |
+      {% macro q(v) %}"{{ v | string | replace('"', '""') }}"{% endmacro %}
+      {% macro b(v) %}{{ 'true' if (v | bool) else 'false' }}{% endmacro %}
+      schema_version,run_id,run_timestamp,technology,host,hostname,fqdn,location,patch_window,patch_wave,change_ticket_id,instance_name,pre_build,post_build,target_build,kb_id,patched,exempt,result,reason_code,aap_job_id
+      {% for r in mssql_report_rows %}
+      {% set pre = r.pre_instance_results | default([]) %}
+      {% set post = r.post_instance_results | default([]) %}
+      {% for n in ((pre | map(attribute='instance_name') | list) + (post | map(attribute='instance_name') | list)) | unique %}
+      {{ r.schema_version | int }},{{ q(r.run_id) }},{{ q(mssql_patch_summary.run_timestamp) }},{{ q(r.technology) }},{{ q(r.host) }},{{ q(r.hostname) }},{{ q(r.fqdn) }},{{ q(r.location) }},{{ q(r.patch_window) }},{{ q(r.patch_wave) }},{{ q(r.change_ticket_id) }},{{ q(n) }},{{ q(pre | selectattr('instance_name', 'equalto', n) | map(attribute='build') | first | default('')) }},{{ q(post | selectattr('instance_name', 'equalto', n) | map(attribute='build') | first | default('')) }},{{ q(r.target_build) }},{{ q(r.kb_id) }},{{ b(r.patched) }},{{ b(r.exempt) }},{{ q(r.result) }},{{ q(r.reason_code) }},{{ q(r.aap_job_id) }}
+      {% endfor %}
+      {% endfor %}
+    dest: "{{ mssql_report_base }}-analytics-instances.csv"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool
+
+- name: Write Markdown summary
+  ansible.builtin.copy:
+    content: |
+      # MSSQL {{ mssql_patch_summary.run_mode | title }} Summary
+
+      - Run ID: {{ mssql_patch_summary.run_id }}
+      - Run timestamp: {{ mssql_patch_summary.run_timestamp }}
+      - KB: {{ mssql_patch_summary.kb_id }}
+      - Target SQL build: {{ mssql_patch_summary.target_build }}
+      - Change ticket: {{ mssql_patch_summary.change_ticket_id }}
+
+      | Metric | Count |
+      |---|---|
+      | Total Systems | {{ mssql_patch_summary.total_systems }} |
+      | Systems Patched | {{ mssql_patch_summary.systems_patched }} |
+      | Systems Not Patched | {{ mssql_patch_summary.systems_not_patched }} |
+      | Not Patched - Exempt | {{ mssql_patch_summary.not_patched.exempt }} |
+      | Not Patched - Already Compliant | {{ mssql_patch_summary.not_patched.already_compliant }} |
+      | Not Patched - Blocked | {{ mssql_patch_summary.not_patched.blocked }} |
+      | Not Patched - Failed | {{ mssql_patch_summary.not_patched.failed }} |
+      | Not Patched - Unknown | {{ mssql_patch_summary.not_patched.unknown }} |
+
+      | Result | Count |
+      |---|---|
+      {% for k, v in mssql_patch_summary.result_counts.items() %}
+      | {{ k }} | {{ v }} |
+      {% endfor %}
+
+      | Host | Result | Patched | Reason Code | Reason |
+      |---|---|---|---|---|
+      {% for r in mssql_report_rows %}
+      | {{ r.host }} | {{ r.result }} | {{ 'Yes' if (r.patched | bool) else 'No' }} | {{ r.reason_code }} | {{ r.reason | replace('|', '/') }} |
+      {% endfor %}
+    dest: "{{ mssql_report_base }}-summary.md"
+    mode: "0640"
+  delegate_to: localhost
+  run_once: true
+  when: mssql_report_write_files | default(true) | bool

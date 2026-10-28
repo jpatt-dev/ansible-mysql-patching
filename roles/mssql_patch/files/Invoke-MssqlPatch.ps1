@@ -116,7 +116,14 @@ finally {
   } catch {
     $result.duration_seconds = 0
   }
-  $result | ConvertTo-Json -Compress -Depth 6
+  # Emit JSON to stdout for Ansible. Always exit 0 when the installer was invoked and
+  # the result was captured (ok=true), including RC 3010 (reboot required). Propagating
+  # 3010 as the process exit code caused Ansible to treat a successful install as a
+  # wrapper failure when stdout/JSON handling was incomplete. The real installer RC
+  # remains in exit_code for Ansible normalization. Exit 1 only when the wrapper itself
+  # failed before a trustworthy installer outcome was captured.
+  [Console]::Out.WriteLine(($result | ConvertTo-Json -Compress -Depth 6))
+  [Console]::Out.Flush()
   if (-not $result.ok) { exit 1 }
-  exit ([int]$result.exit_code)
+  exit 0
 }

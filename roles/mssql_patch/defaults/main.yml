@@ -24,6 +24,25 @@ patch_unsafe_targets:
   - "*"
   - mssql_hosts
 patching_exception_enabled: false
+patching_exception_reference: ""
+
+# Supply patch_serial as Job Template / runtime extra vars. Play-level serial is resolved
+# before per-host execution, so host_vars/group_vars values are not applied to it.
+patch_serial: 1
+patch_location: ""
+patch_window: ""
+patch_wave: ""
+
+mssql_report_schema_version: 1
+mssql_report_write_files: true
+# Controller-side report output. /tmp inside an AAP execution environment is ephemeral and is
+# discarded when the job ends. Point this at approved persistent storage, or have a later step
+# email the files, attach them to ServiceNow, or publish analytics CSVs for Power BI ingestion
+# before the job exits.
+mssql_report_dir: /tmp/mssql_patch_reports
+
+# Seconds to wait for WinRM to recover after each remediation phase before marking the host UNREACHABLE.
+mssql_connectivity_recheck_timeout: 120
 
 mssql_precheck_min_free_disk_mb: 5120
 mssql_precheck_soft_free_disk_mb: 10240
